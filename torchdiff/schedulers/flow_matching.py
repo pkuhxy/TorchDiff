@@ -4,6 +4,7 @@ import logging
 import math
 import torch
 from tqdm.auto import tqdm
+from torchdiff.utils.utils import safe_get_rank
 
 
 class FlowMatchingScheduler:
@@ -93,7 +94,8 @@ class FlowMatchingScheduler:
     ):
         num_inference_steps = self.num_inference_steps
         sigmas = self._set_sigmas(training=False)
-        print(f"sigmas: {sigmas}")
+        if safe_get_rank() == 0:
+            print(f"sigmas: {sigmas}")
         timesteps = sigmas.clone() * 1000
 
         # for loop denoising to get clean latents

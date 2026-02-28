@@ -1,5 +1,7 @@
 import torch
 import logging
+from collections import OrderedDict
+from typing import Hashable, Any
 from accelerate.utils import is_npu_available as accelerate_is_npu_available
 
 def str_to_precision(s):
@@ -59,3 +61,51 @@ def check_and_import_npu():
         import torch_npu
         from torch_npu.contrib import transfer_to_npu
         torch_npu.npu.config.allow_internal_format = False
+
+def safe_get_rank():
+    if torch.distributed.is_initialized():
+        return torch.distributed.get_rank()
+    else:
+        return 0
+
+def contiguous(x):
+    return x.contiguous() if not x.is_contiguous() else x
+
+class SafeCacheManager:
+    """带LRU淘汰机制的缓存管理器"""
+
+    DEFAULT_MAX_CACHE_SIZE = 1
+
+    def __init__(self, max_cache_size: int = DEFAULT_MAX_CACHE_SIZE):
+        self.max_cache_size = max_cache_size
+        self.cache: OrderedDict[Hashable, Any] = OrderedDict()
+
+    def is_exist(self, key: Hashable) -> bool:
+        return key in self.cache
+
+    def get(self, key: Hashable) -> Any:
+        try:
+            value = self.cache[key]
+            self.cache.move_to_end(key, last=True)
+            return value
+        except KeyError:
+            return None
+
+    def _evict_if_needed(self):
+        """根据当前 max_cache_size 淘汰多余条目"""
+        while len(self.cache) > self.max_cache_size > 0:
+            self.cache.popitem(last=False)
+
+    def set(self, key: Hashable, value: Any):
+        """
+        LRU 语义的 set：
+        - 如果 key 已存在，更新并移到队尾
+        - 如果 key 不存在，插入；若超过 max_cache_size，弹出最旧的一个
+        """
+        self.cache[key] = value
+        self.cache.move_to_end(key, last=True)
+        self._evict_if_needed()
+
+    def clear(self):
+        """清空缓存"""
+        self.cache.clear()

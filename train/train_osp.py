@@ -1,10 +1,11 @@
 import os
+import sys
 import math
 import yaml
 from tqdm import tqdm
 import wandb
 
-from torchdiff.utils.utils import check_and_import_npu
+from torchdiff.utils.utils import check_and_import_npu, is_npu_available
 import torch
 check_and_import_npu()
 
@@ -29,7 +30,7 @@ from torchdiff.distributed.utils import (
 )
 from torchdiff.distributed.fsdp2_wrapper import FSDP2_mix_wrapper
 from torchdiff.distributed.fsdp_ema import FSDPEMAModel as EMAModel
-from torchdiff.distributed.cp_wrapper import CP_wrapper
+from torchdiff.distributed.cp_state import cp_state
 
 from torchdiff.modules import (
     WanVAE, 
@@ -38,7 +39,6 @@ from torchdiff.modules import (
     models_main_block, 
     models_blocks_to_float,
     models_blocks_to_output_float,
-    models_cp_plans,
 )
 from torchdiff.schedulers import schedulers
 
@@ -55,12 +55,16 @@ def main(config):
     seed = config.get("seed", 42)
 
     # model config
-    model_name = config.get("model_name", "wan_t2v")
+    model_name = config.get("model_name", "osp_next")
     task = config.get("task", "t2v")
     model_config = config.get("model_config", {})
     vae_config = config.get("vae_config", {})
     text_encoder_config = config.get("text_encoder_config", {})
     scheduler_config = config.get("scheduler_config", {})
+    # skiparse相关
+    sparse_ratio = model_config.get("sparse_ratio", 1)
+    skiparse_1d = model_config.get("skiparse_1d", False)
+    skiparse_2d = model_config.get("skiparse_2d", False)
 
     # data config
     data_config = config.get("data_config", {})
@@ -82,7 +86,9 @@ def main(config):
     ema_update_interval = config.get("ema_update_interval", 1)
     explicit_prefetching_num_blocks = config.get("explicit_prefetching_num_blocks", 0)
     use_context_parallel = config.get("use_context_parallel", False)
+    use_skiparse_context_parallel = config.get("use_skiparse_context_parallel", False)
     deterministic_training = config.get("deterministic_training", False)
+    profiling = config.get("profiling", False)
 
     # save config
     output_dir = config.get("output_dir", "./output")
@@ -122,24 +128,34 @@ def main(config):
     # init cp mesh if use context parallel
     cp_size = 1
     use_context_parallel = use_context_parallel and config.get("cp_size", 1) > 1
-    if use_context_parallel:
-        # cp size == model parallel (FSDP) size
-        cp_size = config.get("cp_size", fsdp_size)
-        if cp_size == fsdp_size:
-            cp_mesh = ddp_fsdp_mesh["fsdp"]
-            dp_group = ddp_fsdp_mesh["ddp"].get_group()
-        # cp size != model parallel (FSDP) size
-        else:
-            dp_cp_mesh = init_device_mesh("cuda", (world_size // cp_size, cp_size), mesh_dim_names=("dp", "cp"))
-            cp_mesh = dp_cp_mesh["cp"]
-            dp_group = dp_cp_mesh["dp"].get_group()
-        log_on_main_process(logger, f"We use context parallel, cp_size: {cp_size}")
-        logger.info(f"rank {rank} use cp mesh {cp_mesh}")
+    # skiparse cp
+    skiparse_cp_size = 1
+    use_skiparse_context_parallel = use_skiparse_context_parallel and config.get("skiparse_cp_size", 1) > 1 and sparse_ratio > 1
+    use_global_context_parallel = use_context_parallel or use_skiparse_context_parallel
+    global_cp_size = 1
+    if use_global_context_parallel:
+        if use_context_parallel:
+            cp_size = config.get("cp_size", 1)
+        if use_skiparse_context_parallel:
+            skiparse_cp_size = config.get("skiparse_cp_size", 1)
+            if skiparse_1d:
+                assert skiparse_cp_size <= sparse_ratio and sparse_ratio % skiparse_cp_size == 0
+            elif skiparse_2d:
+                assert skiparse_cp_size <= sparse_ratio ** 2 and (sparse_ratio ** 2) % skiparse_cp_size == 0
+        global_cp_size = cp_size * skiparse_cp_size
+        # dp * cp * skiparse_cp = world_size
+        dp_global_cp_mesh = init_device_mesh("cuda", (world_size // global_cp_size, cp_size, skiparse_cp_size), mesh_dim_names=("dp", "cp", "skiparse_cp"))
+        dp_group = dp_global_cp_mesh["dp"].get_group()
+        global_cp_group = dp_global_cp_mesh["cp", "skiparse_cp"]._flatten().get_group()
+        cp_group = dp_global_cp_mesh["cp"].get_group()
+        skiparse_cp_group = dp_global_cp_mesh["skiparse_cp"].get_group()
+        log_on_main_process(logger, f"We use context parrallel, global_cp_size: {global_cp_size}, cp_size: {cp_size}, skiparse_cp_size: {skiparse_cp_size}")
+        cp_state.reset(global_cp_group=global_cp_group, cp_group=cp_group, skiparse_cp_group=skiparse_cp_group)
 
-    if (save_interval * gradient_accumulation_steps) % cp_size != 0:
+    if (save_interval * gradient_accumulation_steps) % global_cp_size != 0:
         raise ValueError(
             f"""because we use context parallel and encoder cache,
-            save_interval * gradient_accumulation_steps ({save_interval} * {gradient_accumulation_steps} = {save_interval * gradient_accumulation_steps}) must be multiple of cp_size {cp_size}!
+            save_interval * gradient_accumulation_steps ({save_interval} * {gradient_accumulation_steps} = {save_interval * gradient_accumulation_steps}) must be multiple of global_cp_size {global_cp_size}!
             """
         )
 
@@ -194,10 +210,6 @@ def main(config):
 
     model.train()
 
-    # wrap model with cp wrapper if use context parallel
-    if use_context_parallel:
-        CP_wrapper(model, models_cp_plans[model_name], cp_mesh=cp_mesh)
-
     # wrap model with fsdp2 mix-precision wrapper
     FSDP2_mix_wrapper(
         model,
@@ -249,7 +261,6 @@ def main(config):
     if not has_loaded_pretrained_model:
         log_on_main_process(f"warning! now we train from scratch, please make sure pretrained_model_dir_or_checkpoint={pretrained_model_dir_or_checkpoint} is correct!")
 
-        
     log_on_main_process(logger, "Initializing and loading optimizer checkpoint...")
     learning_rate = optimizer_config.get("lr", 1e-4)
     weight_decay = optimizer_config.get("weight_decay", 1e-2)
@@ -275,15 +286,6 @@ def main(config):
     log_on_main_process(logger, "Initializing dataset, sampler and dataloader...")
     # dataset
     dataset = ultra_datasets[data_config.get("dataset_name", "t2v_random")](**data_config.get("dataset_config", {}))
-    if use_context_parallel:
-        video_shape = (
-            dataset.sample_num_frames // (4 * model.patch_size[0]) + 1,
-            dataset.sample_height // (8 * model.patch_size[1]),
-            dataset.sample_width // (8 * model.patch_size[2]),
-        )
-        text_len = dataset.text_max_length
-        if math.prod(video_shape) % cp_size != 0 or text_len % cp_size != 0:
-            raise ValueError(f"When using context parallel, sequence length {math.prod(video_shape)} must be multiple of cp_size {cp_size}!")
     
     # sampler
     batch_size = data_config.get("batch_size", 1)
@@ -313,7 +315,7 @@ def main(config):
         log_on_main_process(logger, "Loading dataloader state...")
         checkpointer.load_dataloader_state_dict(dataloader)
 
-    encoder_cache_manager = EncoderCacheManager(tp_cp_group=cp_mesh.get_group() if use_context_parallel else None)
+    encoder_cache_manager = EncoderCacheManager(tp_cp_group=global_cp_group if use_global_context_parallel else None)
 
     trainable_params_before_sharding = trainable_params_after_sharding = 0
     locked_params_before_sharding = locked_params_after_sharding = 0
@@ -333,6 +335,7 @@ def main(config):
     start_training_logs = f"""
     {'=' * 20}Start Training{'=' * 20}
     Model: {model_name}
+    Model config: {model_config}
     Before FSDP sharding,
     Model has {params_nums_to_str(trainable_params_before_sharding)} trainable parameters and {params_nums_to_str(locked_params_before_sharding)} locked parameters
     After FSDP sharding,
@@ -342,9 +345,12 @@ def main(config):
     Sampler: {data_config.get("sampler_name", "stateful_distributed")}
     Collator: {data_config.get("collator_name", "wan_t2v")}
     Use Context Parallel: {use_context_parallel}
+    Use Skiparse Context Parallel: {use_skiparse_context_parallel}
     world_size: {world_size} GPUs
     dp_size: {dp_size} GPUs
     cp_size: {cp_size} GPUs
+    skiparse_cp_size: {skiparse_cp_size} GPUs
+    global_cp_size: {global_cp_size} GPUs
     Gradient checkpointing: {gradient_checkpointing}
     Weight dtype: {weight_dtype}
     Reshard after forward: {reshard_after_forward}
@@ -372,7 +378,7 @@ def main(config):
     if checkpointer.last_training_iteration is not None:
         log_on_main_process(logger, "Loading rng state...")
         checkpointer.load_rng_state_dict()
-    
+
     while current_iteration < training_iteration:
         if current_batch_nums % cp_size == 0:
             batch = next(dataloader_iter)
@@ -405,19 +411,43 @@ def main(config):
         timesteps = q_sample_results["timesteps"]
 
         # cp组内同步，防止在同一个cp组里有不同的latents, prior_dist, sigmas, timesteps
-        if use_context_parallel:
-            torch.distributed.broadcast(interpolated_latents, group_src=0, group=cp_mesh.get_group())
-            torch.distributed.broadcast(prior_dist, group_src=0, group=cp_mesh.get_group())
-            torch.distributed.broadcast(sigmas, group_src=0, group=cp_mesh.get_group())
-            torch.distributed.broadcast(timesteps, group_src=0, group=cp_mesh.get_group())
+        if use_global_context_parallel:
+            torch.distributed.broadcast(interpolated_latents, group_src=0, group=global_cp_group)
+            torch.distributed.broadcast(prior_dist, group_src=0, group=global_cp_group)
+            torch.distributed.broadcast(sigmas, group_src=0, group=global_cp_group)
+            torch.distributed.broadcast(timesteps, group_src=0, group=global_cp_group)
 
         with torch.autocast("cuda", dtype=weight_dtype):
-            model_output = model(
-                interpolated_latents,
-                timesteps,
-                text_embeddings,
-                start_frame_latents=start_frame_latents,
-            )
+            if profiling and current_iteration >= 5:
+                if is_npu_available():
+                    import torch_npu
+                    prof = torch_npu.profiler.profile(
+                        activities=[torch_npu.profiler.ProfilerActivity.CPU, 
+                                torch_npu.profiler.ProfilerActivity.CUDA],
+                        with_stack=True, with_modules=True
+                    )
+                else:
+                    prof = torch.profiler.profile(
+                        activities=[torch.profiler.ProfilerActivity.CPU, 
+                                torch.profiler.ProfilerActivity.CUDA],
+                        with_stack=True, with_modules=True
+                    )
+                with prof:
+                    model_output = model(
+                        interpolated_latents,
+                        timesteps,
+                        text_embeddings,
+                        start_frame_latents=start_frame_latents,
+                    )
+                prof.export_chrome_trace(f"{output_dir}/trace_rank{rank}_{current_iteration:09d}.json")
+                if current_iteration > 6: sys.exit(0)
+            else:
+                model_output = model(
+                    interpolated_latents,
+                    timesteps,
+                    text_embeddings,
+                    start_frame_latents=start_frame_latents,
+                )
 
         loss = scheduler.training_losses(model_output, latents, prior_dist)[0]
         loss = loss / gradient_accumulation_steps # default value of gradient_accumulation_steps is 1

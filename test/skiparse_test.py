@@ -1,6 +1,6 @@
 
 import torch
-from torchdiff.modules.osp_hi import SkiparseRearrange, RearrangeType
+from torchdiff.modules.osp_next import SkiparseRearrange, RearrangeType
 
 test_num = 64
 sparse_ratio = 4

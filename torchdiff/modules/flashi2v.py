@@ -228,7 +228,7 @@ class FlashI2VModel(WanModel):
         args = [x, e0, seq_lens, grid_size_for_rope, self.freqs, context, context_lens]
 
         for block in self.blocks:
-            if self.gradient_checkpointing and self.training:
+            if self.gradient_checkpointing and torch.is_grad_enabled():
                 x = torch.utils.checkpoint.checkpoint(block, *args, use_reentrant=False)
             else:
                 x = block(*args)

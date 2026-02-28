@@ -147,6 +147,7 @@ class T2VInferencePipeline(DiffusionPipeline):
         return video
 
     @torch.inference_mode()
+    @torch.no_grad()
     def __call__(
         self,
         prompt,

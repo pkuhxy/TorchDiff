@@ -38,3 +38,4 @@ poetry.lock
 *.egg-info/
 *wandb/
 vbench*/
+output*/

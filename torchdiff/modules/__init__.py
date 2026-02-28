@@ -18,21 +18,32 @@ from .flashi2v import (
     cp_plans as flashi2v_cp_plans
 )
 
+from .osp_next import (
+    models as osp_next_models, 
+    models_main_block as osp_next_models_main_block, 
+    models_blocks_to_float as osp_next_models_blocks_to_float,
+    models_blocks_to_output_float as osp_next_models_blocks_to_output_float,
+)
+
 models = {}
 models.update(wan_models)
 models.update(flashi2v_models)
+models.update(osp_next_models)
 
 models_main_block = {}
 models_main_block.update(wan_models_main_block)
 models_main_block.update(flashi2v_models_main_block)
+models_main_block.update(osp_next_models_main_block)
 
 models_blocks_to_float = {}
 models_blocks_to_float.update(wan_models_blocks_to_float)
 models_blocks_to_float.update(flashi2v_models_blocks_to_float)
+models_blocks_to_float.update(osp_next_models_blocks_to_float)
 
 models_blocks_to_output_float = {}
 models_blocks_to_output_float.update(wan_models_blocks_to_output_float)
 models_blocks_to_output_float.update(flashi2v_models_blocks_to_output_float)
+models_blocks_to_output_float.update(osp_next_models_blocks_to_output_float)
 
 models_cp_plans = {}
 models_cp_plans.update(wan_cp_plans)

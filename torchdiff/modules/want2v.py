@@ -496,6 +496,7 @@ class WanModel(ModelMixin, ConfigMixin):
         e = self.time_embedding(sinusoidal_embedding_1d(self.freq_dim, t).float())
         e0 = self.time_projection(e).unflatten(1, (6, self.dim))
 
+        # 当前实现下只支持batch内等长，无padding的情况
         x, grid_sizes = self.patchify(x)
         seq_lens = torch.tensor(math.prod(grid_sizes), dtype=torch.long, device=device).repeat(x.size(0))
         grid_size_for_rope = torch.tensor(grid_sizes, dtype=torch.long, device=device).unsqueeze(0).repeat(x.size(0), 1)
@@ -511,7 +512,7 @@ class WanModel(ModelMixin, ConfigMixin):
         args = [x, e0, seq_lens, grid_size_for_rope, self.freqs, context, context_lens]
 
         for block in self.blocks:
-            if self.gradient_checkpointing and self.training:
+            if self.gradient_checkpointing and torch.is_grad_enabled():
                 x = torch.utils.checkpoint.checkpoint(block, *args, use_reentrant=False)
             else:
                 x = block(*args)

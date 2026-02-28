@@ -22,6 +22,7 @@ import warnings
 __all__ = [
     'flash_attention',
     'attention',
+    'attention_with_mask',
 ]
 
 
@@ -181,3 +182,29 @@ def attention(
 
         out = out.transpose(1, 2).contiguous()
         return out
+
+def attention_with_mask(
+    q, # [B, N, H, D]
+    k, # [B, N, H, D]
+    v, # [B, N, H, D]
+    attn_mask=None,
+    is_causal=False,
+    dropout_p=0.,
+    dtype=torch.bfloat16,
+):
+    out_dtype = q.dtype
+
+    q = q.transpose(1, 2).to(dtype) # [B, N, H, D] -> [B, H, N, D]
+    k = k.transpose(1, 2).to(dtype) # [B, N, H, D] -> [B, H, N, D]
+    v = v.transpose(1, 2).to(dtype) # [B, N, H, D] -> [B, H, N, D]
+
+    if attn_mask is not None:
+        if attn_mask.dtype != torch.bool:
+            attn_mask = attn_mask.to(dtype)
+        # [B, N] -> [B, 1, 1, N]，作为 key 侧 mask
+        attn_mask = attn_mask[:, None, None, :]
+
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_mask, is_causal=is_causal, dropout_p=dropout_p)
+
+    return out.transpose(1, 2).contiguous().type(out_dtype) # [B, H, N, D] -> [B, N, H, D]
