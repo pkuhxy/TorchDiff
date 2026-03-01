@@ -63,7 +63,7 @@ def _all_to_all_4D(
         # (bs, seqlen/P, hc, hs) -reshape-> (bs, seq_len/P, P, hc/P, hs) -transpose(0,2)-> (P, seq_len/P, bs, hc/P, hs)
         input_t = contiguous(
             input.reshape(bs, shard_seqlen, seq_world_size, shard_hc, hs)
-            .permute(2, 1, 0, 3, 4)
+            .transpose(0, 2)
         )
 
         output = torch.empty_like(input_t)
@@ -74,12 +74,13 @@ def _all_to_all_4D(
         # output shape: [bs, seq_world_size, max_shard_seq_len, shard_hc, hs]
         output = contiguous(
             output
-            .permute(2, 0, 1, 3, 4)
+            .transpose(0, 2)
+            .transpose(1, 2)
         )
         has_variable_len = any(s != max_shard_seq_len for s in shard_seq_lens)
         if has_variable_len:
             chunks = [
-                output[:, i, :shard_seq_lens[i], :, :]  # narrow（view，不分配内存）
+                output[:, i].narrow(1, 0, shard_seq_lens[i])
                 for i in range(seq_world_size)
             ]
             output = torch.cat(chunks, dim=1)  # [bs, total_valid_seq, shard_hc, hs]
@@ -113,7 +114,8 @@ def _all_to_all_4D(
         # (bs, seqlen, hc/P, hs) -reshape-> (bs, P, seq_len/P, hc/P, hs) -transpose(0, 3)-> (hc/P, P, seqlen/P, bs, hs) -transpose(0, 1) -> (P, hc/P, seqlen/P, bs, hs)
         input_t = contiguous(
             input_reshaped.reshape(bs, seq_world_size, shard_seqlen, shard_hc, hs)
-            .permute(1, 3, 2, 0, 4)
+            .transpose(0, 3)
+            .transpose(0, 1)
         )
 
         output = torch.empty_like(input_t)
@@ -125,7 +127,7 @@ def _all_to_all_4D(
         output = contiguous(
             output
             .reshape(hc, shard_seqlen, bs, hs)
-            .permute(2, 1, 0, 3)
+            .transpose(0, 2)
         )
 
         local_shard_seq_len = shard_seq_lens[dist.get_rank(group)]

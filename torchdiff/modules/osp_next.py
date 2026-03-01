@@ -4,6 +4,7 @@ import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.distributed as dist
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from einops import rearrange, repeat, reduce
@@ -142,24 +143,27 @@ class SkiparseRearrange:
             raise ValueError(f"Unsupported rearrange operation: {rearrange_func}")
         self.rearrange_func = getattr(self, rearrange_func)
 
+        # 缓存padding tokens的个数
+        self.padding_cache = SafeCacheManager(max_cache_size=32)
+
     # ----------------- skiparse context parallel -----------------
     """
     skiparse context parallel:
         skiparse rearrange会将序列rearrange到batch维度，我们可以将batch维度划分到不同的skiparse context parallel processes，每个process处理一部分序列。
     """
-    def _skiparse_cp_scatter(self, x):
+    def _skiparse_cp_scatter(self, x, dim=0):
         if not use_skiparse_context_parallel():
             return x
-        B = x.shape[0]
+        size = x.shape[dim]
         cp_size = cp_state.skiparse_cp_size
-        assert B % cp_size == 0
-        chunk_size = B // cp_size
-        return x.narrow(0, cp_state.skiparse_cp_rank * chunk_size, chunk_size)
+        assert size % cp_size == 0
+        chunk_size = size // cp_size
+        return x.narrow(dim, cp_state.skiparse_cp_rank * chunk_size, chunk_size)
     
-    def _skiparse_cp_gather(self, x):
+    def _skiparse_cp_gather(self, x, dim=0):
         if not use_skiparse_context_parallel():
             return x
-        x = all_gather(x, dim=0, group=cp_state.skiparse_cp_group).contiguous()
+        x = all_gather(x, dim=dim, group=cp_state.skiparse_cp_group)
         return x
 
     def _identity(self, x, grid_sizes=None):
@@ -188,6 +192,7 @@ class SkiparseRearrange:
     # def _skiparse_1d_group_reverse(self, x, grid_sizes=None):
     #     return rearrange(x, '(b p) (n q) c -> b (n p q) c', p=self.sparse_ratio, q=self.sparse_ratio)
 
+    # single2group和group2single是完全互逆的，代码实现上是相同的
     # def _skiparse_1d_single_to_group(self, x, grid_sizes=None):
     #     k = int(self.sparse_ratio ** 0.5)
     #     return rearrange(x, '(b p q) (n r s) c -> (b r s) (n p q) c', p=k, q=k, r=k, s=k)
@@ -218,6 +223,7 @@ class SkiparseRearrange:
     #         p1=self.sparse_ratio, q1=self.sparse_ratio, p2=self.sparse_ratio, q2=self.sparse_ratio, h=H // (self.sparse_ratio ** 2), w=W // (self.sparse_ratio ** 2)
     #     )
 
+    # single2group和group2single是完全互逆的，代码实现上是相同的
     # def _skiparse_2d_single_to_group(self, x, grid_sizes):
     #     T, H, W = grid_sizes
     #     return rearrange(
@@ -288,29 +294,18 @@ class SkiparseRearrange:
 
     def _skiparse_1d_single_to_group(self, x, grid_sizes=None):
         """'(b p q) (n r s) c -> (b r s) (n p q) c'"""
-        k = int(self.sparse_ratio ** 0.5)
-        BPQ, NRS, C = x.shape
-        B = BPQ // (k * k)
-        N = NRS // (k * k)
-        # 展开:    [B, p, q, N, r, s, C]   (indices: 0,1,2,3,4,5,6)
-        # 目标:    [B, r, s, N, p, q, C]
-        # permute: (0, 4, 5, 3, 1, 2, 6)
-        return (x.view(B, k, k, N, k, k, C)
-                .permute(0, 4, 5, 3, 1, 2, 6)
-                .reshape(B * k * k, N * k * k, C))
+        k2 = self.sparse_ratio          # k² = sparse_ratio
+        Bk2, Nk2, C = x.shape
+        B = Bk2 // k2
+        N = Nk2 // k2
+        return (x.view(B, k2, N, k2, C)
+                .transpose(1, 3)
+                .contiguous()
+                .view(Bk2, Nk2, C))
 
     def _skiparse_1d_group_to_single(self, x, grid_sizes=None):
         """'(b r s) (n p q) c -> (b p q) (n r s) c'"""
-        k = int(self.sparse_ratio ** 0.5)
-        BRS, NPQ, C = x.shape
-        B = BRS // (k * k)
-        N = NPQ // (k * k)
-        # 展开:    [B, r, s, N, p, q, C]   (indices: 0,1,2,3,4,5,6)
-        # 目标:    [B, p, q, N, r, s, C]
-        # permute: (0, 4, 5, 3, 1, 2, 6)
-        return (x.view(B, k, k, N, k, k, C)
-                .permute(0, 4, 5, 3, 1, 2, 6)
-                .reshape(B * k * k, N * k * k, C))
+        return self._skiparse_1d_single_to_group(x, grid_sizes)
 
     def _skiparse_2d_single(self, x, grid_sizes):
         """'b (t h p w q) c -> (b p q) (t h w) c'"""
@@ -374,7 +369,7 @@ class SkiparseRearrange:
                 .permute(0, 3, 4, 1, 5, 6, 2, 7, 8)
                 .reshape(B, T * H * W, C))
 
-    def _skiparse_2d_single_to_group(self, x, grid_sizes):
+    def _normal_skiparse_2d_single_to_group(self, x, grid_sizes):
         """'(b p2 q2) (t h_p1 p1 w_q1 q1) c -> (b p1 q1) (t h_p1 p2 w_q1 q2) c'"""
         T, H, W = grid_sizes
         P = self.sparse_ratio
@@ -390,35 +385,54 @@ class SkiparseRearrange:
                 .permute(0, 5, 7, 3, 4, 1, 6, 2, 8)
                 .reshape(B * P * P, T * h_p1 * P * w_q1 * P, C))
 
-    def _skiparse_2d_group_to_single(self, x, grid_sizes):
-        """'(b p1 q1) (t h_p1 p2 w_q1 q2) c -> (b p2 q2) (t h_p1 p1 w_q1 q1) c'"""
+    # 采用all_to_all_single实现，通信量更小
+    def _parallel_skiparse_2d_single_to_group(self, x, grid_sizes):
         T, H, W = grid_sizes
         P = self.sparse_ratio
+        sub_grid_sizes = (T, H // P, W // P)
         P2 = P * P
-        h_p1 = H // P2
-        w_q1 = W // P2
-        BP1Q1, _, C = x.shape
-        B = BP1Q1 // (P * P)
-        # 展开:    [B, p1, q1, T, h_p1, p2, w_q1, q2, C]  (indices: 0,1,2,3,4,5,6,7,8)
-        # 目标:    [B, p2, q2, T, h_p1, p1, w_q1, q1, C]
-        # permute: (0, 5, 7, 3, 4, 1, 6, 2, 8)
-        return (x.view(B, P, P, T, h_p1, P, w_q1, P, C)
-                .permute(0, 5, 7, 3, 4, 1, 6, 2, 8)
-                .reshape(B * P * P, T * h_p1 * P * w_q1 * P, C))
-    
+        x = self._skiparse_2d_single(x, sub_grid_sizes)
+        B, _, C = x.shape
+        x = x.view(B // P2, P2, -1, C).transpose(0, 1)
+        out_x = contiguous(torch.empty_like(x))
+        dist.all_to_all_single(out_x, contiguous(x), group=cp_state.skiparse_cp_group)
+        out_x = contiguous(out_x.transpose(0, 1)).view(B, -1, C)
+        out_x = self._skiparse_2d_single_reverse(out_x, sub_grid_sizes)
+        return out_x
 
+    def _skiparse_2d_single_to_group(self, x, grid_sizes):
+        if use_skiparse_context_parallel():
+            return self._parallel_skiparse_2d_single_to_group(x, grid_sizes)
+        # gather -> rearrange -> scatter的实现，通信量比较大，且需要大块内存
+        x = self._skiparse_cp_gather(x)
+        x = self._normal_skiparse_2d_single_to_group(x, grid_sizes)
+        x = self._skiparse_cp_scatter(x)
+        return x
+
+    def _skiparse_2d_group_to_single(self, x, grid_sizes):
+        return self._skiparse_2d_single_to_group(x, grid_sizes)
+    
     def get_num_padding_tokens(self, grid_sizes):
+
+        key = (grid_sizes, self.sparse_ratio, self.rearrange_type)
+        if self.padding_cache.is_exist(key):
+            return self.padding_cache.get(key)
+        
+        paddings = (0, 0)
+
         if self.skiparse_1d:
             block_size = self.sparse_ratio ** 2
             HxW = math.prod(grid_sizes[1:])
             num_padding_tokens = (block_size - HxW % block_size) % block_size
-            return num_padding_tokens, 0
+            paddings = (num_padding_tokens, 0)
         elif self.skiparse_2d:
             block_size = self.sparse_ratio ** 2
             num_padding_tokens_h = (block_size - grid_sizes[1] % block_size) % block_size
             num_padding_tokens_w = (block_size - grid_sizes[2] % block_size) % block_size
-            return num_padding_tokens_h, num_padding_tokens_w
-        return 0, 0
+            paddings = (num_padding_tokens_h, num_padding_tokens_w)
+
+        self.padding_cache.set(key, paddings)
+        return paddings
         
     def __call__(self, x, grid_sizes=None):
         """
@@ -492,9 +506,7 @@ class SkiparseRearrange:
                 T, H, W = grid_sizes
                 num_padding_tokens_h, num_padding_tokens_w = self.get_num_padding_tokens(grid_sizes)
                 grid_sizes = (T, H + num_padding_tokens_h, W + num_padding_tokens_w)
-            x = self._skiparse_cp_gather(x)
             x = self.rearrange_func(x, grid_sizes)
-            x = self._skiparse_cp_scatter(x)
         return x
 
 
