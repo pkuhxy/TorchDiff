@@ -640,14 +640,16 @@ class ContextParallelPreprocessor(MetaPreprocessor):
             x = all_gather(x, dim=1, group=cp_state.cp_group)
             x_list = x.split_with_sizes(shard_seq_lens, dim=1)
 
-            full = torch.empty(B, T, H * W, C, device=x.device, dtype=x.dtype)
-
+            x_out = []
             for r in range(cp_size):
                 start = r * seq_hw
+                assert start < H * W, "The start index should be less than the total number of tokens"
                 end = min(start + seq_hw, H * W)
-                full[:, :, start:end, :] = x_list[r].view(B, T, end - start, C)
+                hw_len = end - start
+                x_out.append(contiguous(x_list[r]).view(B, T, hw_len, C))
 
-            return contiguous(full).view(B, -1, C)
+            x_out = torch.cat(x_out, dim=2)
+            return contiguous(x_out).view(B, -1, C)
 
         # ========== skiparse 2d 逆 ==========
         if self.is_skiparse_2d_model:
@@ -658,8 +660,8 @@ class ContextParallelPreprocessor(MetaPreprocessor):
             B, _, C = x.shape
             x = all_gather(x, dim=1, group=cp_state.cp_group)
             x_list = x.split_with_sizes(shard_seq_lens, dim=1)
-            full = torch.empty(B, T, H, W, C, device=x.device, dtype=x.dtype)
-
+            x_out_w = []
+            x_out = []
             for r in range(cp_size):
                 index_h = r // cp_size_w
                 index_w = r % cp_size_w
@@ -670,9 +672,12 @@ class ContextParallelPreprocessor(MetaPreprocessor):
 
                 h_len = end_h - start_h
                 w_len = end_w - start_w
-                full[:, :, start_h:end_h, start_w:end_w, :] = x_list[r].view(B, T, h_len, w_len, C)
-
-            return contiguous(full).view(B, -1, C)
+                x_out_w.append(contiguous(x_list[r]).view(B, T, h_len, w_len, C))
+                if index_w == cp_size_w - 1 and len(x_out_w) == cp_size_w:
+                    x_out.append(torch.cat(x_out_w, dim=3))
+                    x_out_w = []
+            x_out = torch.cat(x_out, dim=2)
+            return contiguous(x_out).view(B, -1, C)
 
         # ========== 普通 cp 逆 ==========
         return all_gather(x, dim=1, group=cp_state.cp_group)
@@ -957,25 +962,27 @@ class OSPNextCrossAttention(OSPNextSelfAttention):
         k = self.norm_k(self.k(text)).view(B, -1, H, D)
         v = self.v(text).view(B, -1, H, D)
 
-        if use_context_parallel():
-            if num_register_tokens > 0:
-                register_q, q = q.split_with_sizes([num_register_tokens, N - num_register_tokens], dim=1)
-            q = all_to_all_4D(q, group=cp_state.cp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
-            if num_register_tokens > 0:
-                register_q = torch.chunk(register_q, cp_state.cp_size, dim=2)[cp_state.cp_rank]
-                q = torch.cat([register_q, q], dim=1)
-            k = torch.chunk(k, cp_state.cp_size, dim=2)[cp_state.cp_rank]
-            v = torch.chunk(v, cp_state.cp_size, dim=2)[cp_state.cp_rank]
+        # NOTE cross attn不需要all2all，因为img只作为q，天然支持按序列切分计算
+        # if use_context_parallel():
+        #     if num_register_tokens > 0:
+        #         register_q, q = q.split_with_sizes([num_register_tokens, N - num_register_tokens], dim=1)
+        #     q = all_to_all_4D(q, group=cp_state.cp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
+        #     if num_register_tokens > 0:
+        #         register_q = torch.chunk(register_q, cp_state.cp_size, dim=2)[cp_state.cp_rank]
+        #         q = torch.cat([register_q, q], dim=1)
+        #     k = torch.chunk(k, cp_state.cp_size, dim=2)[cp_state.cp_rank]
+        #     v = torch.chunk(v, cp_state.cp_size, dim=2)[cp_state.cp_rank]
 
         x = attention_with_mask(q, k, v, attn_mask=None)
 
-        if use_context_parallel():
-            if num_register_tokens > 0:
-                register_x, x = x.split_with_sizes([num_register_tokens, N - num_register_tokens], dim=1)
-                register_x = all_gather(register_x, dim=2, group=cp_state.cp_group)
-            x = all_to_all_4D(x, group=cp_state.cp_group, scatter_dim=1, gather_dim=2, shard_seq_lens=shard_seq_lens)
-            if num_register_tokens > 0:
-                x = torch.cat([register_x, x], dim=1)
+        # NOTE cross attn不需要all2all，因为img只作为q，天然支持按序列切分计算
+        # if use_context_parallel():
+        #     if num_register_tokens > 0:
+        #         register_x, x = x.split_with_sizes([num_register_tokens, N - num_register_tokens], dim=1)
+        #         register_x = all_gather(register_x, dim=2, group=cp_state.cp_group)
+        #     x = all_to_all_4D(x, group=cp_state.cp_group, scatter_dim=1, gather_dim=2, shard_seq_lens=shard_seq_lens)
+        #     if num_register_tokens > 0:
+        #         x = torch.cat([register_x, x], dim=1)
         
         # output
         x = x.flatten(2)
