@@ -2,18 +2,30 @@
 import torch
 
 from torchdiff.utils.utils import is_npu_available
-if is_npu_available():
-    import torch_npu
+from einops import rearrange
 
-# try:
-#     import flash_attn_interface
-#     FLASH_ATTN_3_AVAILABLE = True
-# except ModuleNotFoundError:
-FLASH_ATTN_3_AVAILABLE = False
+try:
+    import flash_attn_interface
+    # 变长算子
+    from flash_attn_interface import flash_attn_varlen_func as flash_attn_varlen_func_v3
+    # 定长算子
+    from flash_attn_interface import flash_attn_func as flash_attn_func_v3
+    FLASH_ATTN_3_AVAILABLE = True
+except ModuleNotFoundError:
+    FLASH_ATTN_3_AVAILABLE = False
 
 try:
     import flash_attn
     FLASH_ATTN_2_AVAILABLE = True
+    from flash_attn import (
+        # 变长算子
+        flash_attn_varlen_qkvpacked_func,
+        flash_attn_varlen_func, 
+        # 定长算子
+        flash_attn_qkvpacked_func, 
+        flash_attn_func
+    )
+    from flash_attn.bert_padding import pad_input, unpad_input
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
 
@@ -180,31 +192,321 @@ def attention(
         out = torch.nn.functional.scaled_dot_product_attention(
             q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
 
-        out = out.transpose(1, 2).contiguous()
+        out = out.transpose(1, 2)
         return out
+
+# adapted from https://github.com/Dao-AILab/flash-attention/blob/13403e81157ba37ca525890f2f0f2137edf75311/flash_attn/flash_attention.py#L27
+def flash_attn_no_pad(
+    q,
+    k,
+    v,
+    attn_mask=None,
+    attn_mask_kv=None,
+    is_cross_attn=False,
+    causal=False,
+    dropout_p=0.0,
+    softmax_scale=None,
+    deterministic=False,
+):
+    batch_size, seq_len_q, num_heads, _ = q.shape
+    _, seq_len_kv, num_heads_kv, _ = k.shape
+
+    if is_cross_attn:
+        mask_q = attn_mask
+        mask_kv = attn_mask_kv
+    else:
+        mask_q = attn_mask
+        mask_kv = attn_mask
+
+    no_mask_q = mask_q is None
+    no_mask_kv = mask_kv is None
+
+    # ==================================================================
+    # Case 1: 完全无 mask
+    # ==================================================================
+    if no_mask_q and no_mask_kv:
+        if not is_cross_attn:
+            qkv = torch.stack([q, k, v], dim=2)
+            return flash_attn_qkvpacked_func(
+                qkv,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                deterministic=deterministic,
+            )
+        else:
+            return flash_attn_func(
+                q, k, v,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                deterministic=deterministic,
+            )
+
+    # ==================================================================
+    # Case 2: 有 mask → 只 unpad 有 mask 的一侧
+    # ==================================================================
+    # --- 特殊路径: self-attn + 有 mask → qkvpacked ---
+    if not is_cross_attn and not no_mask_q:
+        qkv = torch.cat([q, k, v], dim=2)
+        x = rearrange(qkv, "b s three_h d -> b s (three_h d)")
+        x_unpad, indices, cu_seqlens, max_s, _ = unpad_input(x, mask_q)
+        x_unpad = rearrange(
+            x_unpad, "nnz (three h d) -> nnz three h d",
+            three=3, h=num_heads,
+        )
+        output_unpad = flash_attn_varlen_qkvpacked_func(
+            x_unpad, cu_seqlens, max_s, dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            deterministic=deterministic,
+        )
+        output = rearrange(
+            pad_input(
+                rearrange(output_unpad, "nnz h d -> nnz (h d)"),
+                indices, batch_size, seq_len_q,
+            ),
+            "b s (h d) -> b s h d", h=num_heads,
+        )
+        return output
+
+    # --- 通用路径: cross-attn 或 mask 不同 ---
+    # Q 侧
+    if no_mask_q:
+        q_unpad = rearrange(q, "b s h d -> (b s) h d")
+        indices_q = None
+        cu_seqlens_q = torch.arange(
+            0, (batch_size + 1) * seq_len_q, seq_len_q,
+            device=q.device, dtype=torch.int32,
+        )
+        max_seqlen_q = seq_len_q
+    else:
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(
+            rearrange(q, "b s h d -> b s (h d)"), mask_q
+        )
+        q_unpad = rearrange(q_unpad, "nnz (h d) -> nnz h d", h=num_heads)
+
+    # KV 侧
+    if no_mask_kv:
+        k_unpad = rearrange(k, "b s h d -> (b s) h d")
+        v_unpad = rearrange(v, "b s h d -> (b s) h d")
+        cu_seqlens_kv = torch.arange(
+            0, (batch_size + 1) * seq_len_kv, seq_len_kv,
+            device=k.device, dtype=torch.int32,
+        )
+        max_seqlen_kv = seq_len_kv
+    else:
+        k_unpad, _, cu_seqlens_kv, max_seqlen_kv, _ = unpad_input(
+            rearrange(k, "b s h d -> b s (h d)"), mask_kv
+        )
+        v_unpad, _, _, _, _ = unpad_input(
+            rearrange(v, "b s h d -> b s (h d)"), mask_kv
+        )
+        k_unpad = rearrange(k_unpad, "nnz (h d) -> nnz h d", h=num_heads_kv)
+        v_unpad = rearrange(v_unpad, "nnz (h d) -> nnz h d", h=num_heads_kv)
+
+    output_unpad = flash_attn_varlen_func(
+        q_unpad, k_unpad, v_unpad,
+        cu_seqlens_q, cu_seqlens_kv,
+        max_seqlen_q, max_seqlen_kv, dropout_p,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        deterministic=deterministic,
+    )
+
+    if indices_q is not None:
+        output = rearrange(
+            pad_input(
+                rearrange(output_unpad, "nnz h d -> nnz (h d)"),
+                indices_q, batch_size, seq_len_q,
+            ),
+            "b s (h d) -> b s h d", h=num_heads,
+        )
+    else:
+        output = rearrange(output_unpad, "(b s) h d -> b s h d", b=batch_size)
+
+    return output
+
+def flash_attn_no_pad_v3(
+    q,
+    k,
+    v,
+    attn_mask=None,
+    attn_mask_kv=None,
+    is_cross_attn=False,
+    causal=False,
+    softmax_scale=None,
+    deterministic=False,
+):
+    if flash_attn_varlen_func_v3 is None:
+        raise ImportError("FlashAttention V3 backend not available")
+
+    batch_size, seq_len_q, num_heads, _ = q.shape
+    _, seq_len_kv, num_heads_kv, _ = k.shape
+
+    if is_cross_attn:
+        mask_q = attn_mask
+        mask_kv = attn_mask_kv
+    else:
+        mask_q = attn_mask
+        mask_kv = attn_mask
+
+    no_mask_q = mask_q is None
+    no_mask_kv = mask_kv is None
+
+    # ==================================================================
+    # Case 1: 完全无 mask → 不需要 unpad
+    # ==================================================================
+    if no_mask_q and no_mask_kv:
+        output, _ = flash_attn_func_v3(
+            q, k, v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            deterministic=deterministic,
+        )
+        return output
+
+    # ==================================================================
+    # Case 2: 有 mask → 按需 unpad（只 unpad 有 mask 的一侧）
+    # ==================================================================
+
+    # ---- 处理 Q 侧 ----
+    if no_mask_q:
+        q_unpad = rearrange(q, "b s h d -> (b s) h d")
+        indices_q = None
+        cu_seqlens_q = torch.arange(
+            0, (batch_size + 1) * seq_len_q, seq_len_q,
+            device=q.device, dtype=torch.int32,
+        )
+        max_seqlen_q = seq_len_q
+    else:
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(
+            rearrange(q, "b s h d -> b s (h d)"), mask_q
+        )
+        q_unpad = rearrange(q_unpad, "nnz (h d) -> nnz h d", h=num_heads)
+
+    # ---- 处理 KV 侧 ----
+    if no_mask_kv:
+        k_unpad = rearrange(k, "b s h d -> (b s) h d")
+        v_unpad = rearrange(v, "b s h d -> (b s) h d")
+        cu_seqlens_kv = torch.arange(
+            0, (batch_size + 1) * seq_len_kv, seq_len_kv,
+            device=k.device, dtype=torch.int32,
+        )
+        max_seqlen_kv = seq_len_kv
+    else:
+        k_unpad, _, cu_seqlens_kv, max_seqlen_kv, _ = unpad_input(
+            rearrange(k, "b s h d -> b s (h d)"), mask_kv
+        )
+        v_unpad, _, _, _, _ = unpad_input(
+            rearrange(v, "b s h d -> b s (h d)"), mask_kv
+        )
+        k_unpad = rearrange(k_unpad, "nnz (h d) -> nnz h d", h=num_heads_kv)
+        v_unpad = rearrange(v_unpad, "nnz (h d) -> nnz h d", h=num_heads_kv)
+
+    # ---- Flash Attention V3 计算 ----
+    output_unpad, _ = flash_attn_varlen_func_v3(
+        q_unpad, k_unpad, v_unpad,
+        cu_seqlens_q, cu_seqlens_kv,
+        max_seqlen_q, max_seqlen_kv,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        deterministic=deterministic,
+    )
+
+    # ---- 恢复 output 形状 ----
+    if indices_q is not None:
+        output = rearrange(
+            pad_input(
+                rearrange(output_unpad, "nnz h d -> nnz (h d)"),
+                indices_q, batch_size, seq_len_q,
+            ),
+            "b s (h d) -> b s h d", h=num_heads,
+        )
+    else:
+        output = rearrange(output_unpad, "(b s) h d -> b s h d", b=batch_size)
+
+    return output
+
+def scaled_dot_product_attention_with_mask(
+    q, # [B, N, H, D]
+    k, # [B, N, H, D]
+    v, # [B, N, H, D]
+    attn_mask=None,
+    causal=False,
+    dropout_p=0.,
+):
+    q = q.transpose(1, 2) # [B, N, H, D] -> [B, H, N, D]
+    k = k.transpose(1, 2) # [B, N, H, D] -> [B, H, N, D]
+    v = v.transpose(1, 2) # [B, N, H, D] -> [B, H, N, D]
+
+    if attn_mask is not None:
+        if attn_mask.dtype != torch.bool:
+            attn_mask = attn_mask.to(q.dtype)
+        # [B, N] -> [B, 1, 1, N]，作为 key 侧 mask
+        attn_mask = attn_mask[:, None, None, :]
+
+    out = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+
+    return out.transpose(1, 2) # [B, H, N, D] -> [B, N, H, D]
 
 def attention_with_mask(
     q, # [B, N, H, D]
     k, # [B, N, H, D]
     v, # [B, N, H, D]
     attn_mask=None,
-    is_causal=False,
+    attn_mask_kv=None,
+    is_cross_attn=False,
+    causal=False,
+    softmax_scale=None,
+    deterministic=False,
     dropout_p=0.,
     dtype=torch.bfloat16,
 ):
     out_dtype = q.dtype
+    q = q.to(dtype)
+    k = k.to(dtype)
+    v = v.to(dtype)
 
-    q = q.transpose(1, 2).to(dtype) # [B, N, H, D] -> [B, H, N, D]
-    k = k.transpose(1, 2).to(dtype) # [B, N, H, D] -> [B, H, N, D]
-    v = v.transpose(1, 2).to(dtype) # [B, N, H, D] -> [B, H, N, D]
+    # ========== npu不支持flash attn接口，走SDPA ==========
+    if is_npu_available() or (not FLASH_ATTN_2_AVAILABLE and not FLASH_ATTN_3_AVAILABLE):
+        output = scaled_dot_product_attention_with_mask(
+            q=q,
+            k=k,
+            v=v,
+            attn_mask=attn_mask_kv,
+            causal=causal,
+            dropout_p=dropout_p,
+        )
+    # ========== 优先用 Flash Attention V3 ==========
+    elif FLASH_ATTN_3_AVAILABLE:
+        output = flash_attn_no_pad_v3(
+            q=q,
+            k=k,
+            v=v,
+            attn_mask=attn_mask,
+            attn_mask_kv=attn_mask_kv,
+            is_cross_attn=is_cross_attn,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            deterministic=deterministic,
+        )
+    # ========== 降级用 Flash Attention V2 ==========
+    elif FLASH_ATTN_2_AVAILABLE:
+        output = flash_attn_no_pad(
+            q=q,
+            k=k,
+            v=v,
+            attn_mask=attn_mask,
+            attn_mask_kv=attn_mask_kv,
+            is_cross_attn=is_cross_attn,
+            causal=causal,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            deterministic=deterministic,
+        )
+    else:
+        raise ValueError(f"No supported attention backend found, FLASH_ATTN_2_AVAILABLE: {FLASH_ATTN_2_AVAILABLE}, FLASH_ATTN_3_AVAILABLE: {FLASH_ATTN_3_AVAILABLE}")
 
-    if attn_mask is not None:
-        if attn_mask.dtype != torch.bool:
-            attn_mask = attn_mask.to(dtype)
-        # [B, N] -> [B, 1, 1, N]，作为 key 侧 mask
-        attn_mask = attn_mask[:, None, None, :]
-
-    out = torch.nn.functional.scaled_dot_product_attention(
-        q, k, v, attn_mask=attn_mask, is_causal=is_causal, dropout_p=dropout_p)
-
-    return out.transpose(1, 2).contiguous().type(out_dtype) # [B, H, N, D] -> [B, N, H, D]
+    return output.to(out_dtype)

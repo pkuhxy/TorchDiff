@@ -69,6 +69,8 @@ def safe_get_rank():
         return 0
 
 def contiguous(x):
+    if x is None:
+        return None
     return x.contiguous() if not x.is_contiguous() else x
 
 class SafeCacheManager:

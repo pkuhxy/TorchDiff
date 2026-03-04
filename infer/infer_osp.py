@@ -1,4 +1,5 @@
 import os
+import math
 import yaml
 from argparse import ArgumentParser
 import torch.distributed as dist
@@ -10,7 +11,12 @@ check_and_import_npu()
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoTokenizer
 
-from torchdiff.distributed.utils import setup_distributed_env, cleanup_distributed_env, gather_tensor_list_to_one
+from torchdiff.distributed.utils import (
+    setup_distributed_env, 
+    cleanup_distributed_env, 
+    gather_tensor_list_to_one, 
+    set_modules_to_forward_prefetch,
+)
 from torchdiff.distributed.fsdp2_wrapper import FSDP2_mix_wrapper
 from torchdiff.distributed.cp_state import cp_state
 from torchdiff.modules import (
@@ -45,6 +51,7 @@ def main(config):
     sparse_ratio = model_config.get("sparse_ratio", 1)
     skiparse_1d = model_config.get("skiparse_1d", False)
     skiparse_2d = model_config.get("skiparse_2d", False)
+    num_full_blocks = model_config.get("num_full_blocks", 0)
 
     # inference config
     pipeline_name = config.get("pipeline_name", "t2v")
@@ -59,6 +66,7 @@ def main(config):
     use_skiparse_context_parallel = config.get("use_skiparse_context_parallel", False)
     reshard_after_forward = config.get("reshard_after_forward", None)
     model_cpu_offload = config.get("model_cpu_offload", False)
+    explicit_prefetching_num_blocks = config.get("explicit_prefetching_num_blocks", 0)
 
     # save config
     output_dir = config.get("output_dir", "./output")
@@ -91,6 +99,11 @@ def main(config):
     use_skiparse_context_parallel = use_skiparse_context_parallel and config.get("skiparse_cp_size", 1) > 1 and sparse_ratio > 1
     use_global_context_parallel = use_context_parallel or use_skiparse_context_parallel
     global_cp_size = 1
+    # full cp size
+    # 用于混合full attn blocks和skiparse blocks时对于full blocks采用的cp group
+    full_cp_size = 1
+    use_full_blocks_context_parallel = use_global_context_parallel and (skiparse_1d or skiparse_2d) and num_full_blocks > 0
+    # use_full_blocks_context_parallel = False
     if use_global_context_parallel:
         if use_context_parallel:
             cp_size = config.get("cp_size", 1)
@@ -100,13 +113,14 @@ def main(config):
                 assert skiparse_cp_size <= sparse_ratio and sparse_ratio % skiparse_cp_size == 0
             elif skiparse_2d:
                 assert skiparse_cp_size <= sparse_ratio ** 2 and (sparse_ratio ** 2) % skiparse_cp_size == 0
-        global_cp_size = cp_size * skiparse_cp_size
-        # dp * cp * skiparse_cp = world_size
-        dp_global_cp_mesh = init_device_mesh("cuda", (world_size // global_cp_size, cp_size, skiparse_cp_size), mesh_dim_names=("dp", "cp", "skiparse_cp"))
+        global_cp_size = skiparse_cp_size * cp_size
+        # dp * skiparse_cp * cp = world_size
+        # 先skiparse_cp后cp，因为skiparse_cp的通信量更小
+        dp_global_cp_mesh = init_device_mesh("cuda", (world_size // global_cp_size, skiparse_cp_size, cp_size), mesh_dim_names=("dp", "skiparse_cp", "cp"))
         dp_group = dp_global_cp_mesh["dp"].get_group()
-        global_cp_group = dp_global_cp_mesh["cp", "skiparse_cp"]._flatten().get_group()
-        cp_group = dp_global_cp_mesh["cp"].get_group()
+        global_cp_group = dp_global_cp_mesh["skiparse_cp", "cp"]._flatten().get_group()
         skiparse_cp_group = dp_global_cp_mesh["skiparse_cp"].get_group()
+        cp_group = dp_global_cp_mesh["cp"].get_group()
         log_on_main_process(logger, f"We use context parrallel, global_cp_size: {global_cp_size}, cp_size: {cp_size}, skiparse_cp_size: {skiparse_cp_size}")
         cp_state.reset(global_cp_group=global_cp_group, cp_group=cp_group, skiparse_cp_group=skiparse_cp_group)
 
@@ -152,8 +166,21 @@ def main(config):
     else:
         raise ValueError(f"In inference mode, pretrained_model_dir_or_checkpoint {pretrained_model_dir_or_checkpoint} must be specified!")
 
-    if use_context_parallel and model.num_heads % cp_size != 0:
-        raise ValueError(f"When using context parallel, num_heads {model.num_heads} mush be mutiple of cp_size {cp_size}!")
+    if use_context_parallel or use_full_blocks_context_parallel:
+        if use_context_parallel and model.num_heads % cp_size != 0:
+            raise ValueError(f"When using context parallel, num_heads {model.num_heads} mush be mutiple of cp_size {cp_size}!")
+        if use_full_blocks_context_parallel:
+            if global_cp_size <= model.num_heads and model.num_heads % global_cp_size == 0:
+                full_cp_size = global_cp_size
+            # 找到model.num_heads与global_cp_size的最大公约数
+            else:
+                gcd = math.gcd(model.num_heads, global_cp_size)
+                full_cp_size = gcd
+            # full_cp_size一定是global_cp_size的约数，而global_cp_size一定是world_size的约数
+            # 所以full_cp_group一定是global_cp_group的子集
+            dummy_mesh = init_device_mesh("cuda", (world_size // full_cp_size, full_cp_size), mesh_dim_names=("dummy", "full_cp"))
+            full_cp_group = dummy_mesh["full_cp"].get_group()
+            cp_state.reset(full_cp_group=full_cp_group)
     
     model.eval()
 
@@ -168,6 +195,9 @@ def main(config):
         reshard_after_forward=reshard_after_forward,
         cpu_offload=model_cpu_offload,
     )
+
+    if explicit_prefetching_num_blocks > 0:
+        set_modules_to_forward_prefetch(model.blocks, num_to_forward_prefetch=explicit_prefetching_num_blocks)
 
     if not has_loaded_pretrained_model:
         model.to_empty(device=device)

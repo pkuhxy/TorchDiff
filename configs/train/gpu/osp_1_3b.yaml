@@ -10,9 +10,10 @@ training_iteration: 1000000
 fsdp_size: 8
 cp_size: 4
 skiparse_cp_size: 4
-use_context_parallel: True
-use_skiparse_context_parallel: False
+use_context_parallel: False
+use_skiparse_context_parallel: True
 reshard_after_forward: False
+explicit_prefetching_num_blocks: 2
 gradient_checkpointing: True
 gradient_accumulation_steps: 1
 init_max_grad_norm: 1.0
@@ -22,7 +23,7 @@ weight_dtype: "bf16"
 ema_decay: 0.9999
 ema_update_interval: 1
 save_with_dcp_api: True
-profiling: True
+profiling: False
 
 wandb_config:
   project_name: "osp_next"
@@ -39,7 +40,7 @@ model_config:
   text_len: 512
   skiparse_model_type: "dual_end"
   sparse_ratio: 2
-  num_full_blocks: 4
+  num_full_blocks: 8
   num_register_tokens: 0
   skiparse_1d: False
   skiparse_2d: True
