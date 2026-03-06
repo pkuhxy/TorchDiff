@@ -10,6 +10,9 @@ class EncoderCacheManager:
         self.vae_cache = None
         self.text_cache = None
 
+    def use_cache(self):
+        return self.tp_cp_size > 1
+
     def save_cache(self, vae_latents_list, text_embeds_list):
         self.vae_cache = vae_latents_list
         self.text_cache = text_embeds_list

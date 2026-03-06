@@ -155,9 +155,12 @@ def main(config):
         dp_group = dp_global_cp_mesh["dp"].get_group()
         global_cp_group = dp_global_cp_mesh["skiparse_cp", "cp"]._flatten().get_group()
         skiparse_cp_group = dp_global_cp_mesh["skiparse_cp"].get_group()
-        cp_group = dp_global_cp_mesh["cp"].get_group()
+        # 初始化的时候full_blocks_cp_group和cp_group是同一个group
+        full_cp_group = cp_group = dp_global_cp_mesh["cp"].get_group()
         log_on_main_process(logger, f"We use context parrallel, global_cp_size: {global_cp_size}, cp_size: {cp_size}, skiparse_cp_size: {skiparse_cp_size}")
-        cp_state.reset(global_cp_group=global_cp_group, cp_group=cp_group, skiparse_cp_group=skiparse_cp_group)
+        cp_state.reset(global_cp_group=global_cp_group, cp_group=cp_group, skiparse_cp_group=skiparse_cp_group, full_cp_group=full_cp_group)
+
+    print(f"use_global_context_parallel: {use_global_context_parallel}, use_context_parallel: {use_context_parallel}, use_skiparse_context_parallel: {use_skiparse_context_parallel}, use_full_blocks_context_parallel: {use_full_blocks_context_parallel}")
 
     if (save_interval * gradient_accumulation_steps) % global_cp_size != 0:
         raise ValueError(
@@ -364,8 +367,10 @@ def main(config):
     Dataset: {data_config.get("dataset_name", "t2v_random")}
     Sampler: {data_config.get("sampler_name", "stateful_distributed")}
     Collator: {data_config.get("collator_name", "wan_t2v")}
+    Use Encoder Cache Manager: {encoder_cache_manager.use_cache()}
     Use Context Parallel: {use_context_parallel}
     Use Skiparse Context Parallel: {use_skiparse_context_parallel}
+    Use Full Blocks Context Parallel: {use_full_blocks_context_parallel}
     world_size: {world_size} GPUs
     dp_size: {dp_size} GPUs
     cp_size: {cp_size} GPUs
@@ -400,7 +405,7 @@ def main(config):
         checkpointer.load_rng_state_dict()
 
     while current_iteration < training_iteration:
-        if current_batch_nums % cp_size == 0:
+        if current_batch_nums % global_cp_size == 0:
             batch = next(dataloader_iter)
             video = batch.pop(VIDEO, None).to(dtype=torch.float32, device=device)
             prompt_ids = batch.pop(PROMPT_IDS, None).to(device=device)

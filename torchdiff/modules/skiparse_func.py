@@ -4,7 +4,7 @@ import torch.distributed as dist
 from einops import rearrange, repeat as einops_repeat, reduce as einops_reduce
 from torchdiff.utils.utils import contiguous
 
-def identity(x, grid_sizes=None):
+def identity(x, grid_sizes=None, sparse_ratio=1):
     return x
 
 def repeat(x, grid_sizes=None, sparse_ratio=1):

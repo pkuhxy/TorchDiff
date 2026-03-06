@@ -25,9 +25,10 @@ try:
         flash_attn_qkvpacked_func, 
         flash_attn_func
     )
-    from flash_attn.bert_padding import pad_input, unpad_input
 except ModuleNotFoundError:
     FLASH_ATTN_2_AVAILABLE = False
+
+from torchdiff.utils.padding import pad_input, unpad_input
 
 import warnings
 
@@ -250,7 +251,7 @@ def flash_attn_no_pad(
     if not is_cross_attn and not no_mask_q:
         qkv = torch.cat([q, k, v], dim=2)
         x = rearrange(qkv, "b s three_h d -> b s (three_h d)")
-        x_unpad, indices, cu_seqlens, max_s, _ = unpad_input(x, mask_q)
+        x_unpad, indices, cu_seqlens, max_s = unpad_input(x, mask_q)
         x_unpad = rearrange(
             x_unpad, "nnz (three h d) -> nnz three h d",
             three=3, h=num_heads,
@@ -281,7 +282,7 @@ def flash_attn_no_pad(
         )
         max_seqlen_q = seq_len_q
     else:
-        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q = unpad_input(
             rearrange(q, "b s h d -> b s (h d)"), mask_q
         )
         q_unpad = rearrange(q_unpad, "nnz (h d) -> nnz h d", h=num_heads)
@@ -296,10 +297,10 @@ def flash_attn_no_pad(
         )
         max_seqlen_kv = seq_len_kv
     else:
-        k_unpad, _, cu_seqlens_kv, max_seqlen_kv, _ = unpad_input(
+        k_unpad, _, cu_seqlens_kv, max_seqlen_kv = unpad_input(
             rearrange(k, "b s h d -> b s (h d)"), mask_kv
         )
-        v_unpad, _, _, _, _ = unpad_input(
+        v_unpad, _, _, _ = unpad_input(
             rearrange(v, "b s h d -> b s (h d)"), mask_kv
         )
         k_unpad = rearrange(k_unpad, "nnz (h d) -> nnz h d", h=num_heads_kv)
@@ -380,7 +381,7 @@ def flash_attn_no_pad_v3(
         )
         max_seqlen_q = seq_len_q
     else:
-        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q = unpad_input(
             rearrange(q, "b s h d -> b s (h d)"), mask_q
         )
         q_unpad = rearrange(q_unpad, "nnz (h d) -> nnz h d", h=num_heads)
@@ -395,10 +396,10 @@ def flash_attn_no_pad_v3(
         )
         max_seqlen_kv = seq_len_kv
     else:
-        k_unpad, _, cu_seqlens_kv, max_seqlen_kv, _ = unpad_input(
+        k_unpad, _, cu_seqlens_kv, max_seqlen_kv = unpad_input(
             rearrange(k, "b s h d -> b s (h d)"), mask_kv
         )
-        v_unpad, _, _, _, _ = unpad_input(
+        v_unpad, _, _, _ = unpad_input(
             rearrange(v, "b s h d -> b s (h d)"), mask_kv
         )
         k_unpad = rearrange(k_unpad, "nnz (h d) -> nnz h d", h=num_heads_kv)

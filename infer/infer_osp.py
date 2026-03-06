@@ -120,9 +120,10 @@ def main(config):
         dp_group = dp_global_cp_mesh["dp"].get_group()
         global_cp_group = dp_global_cp_mesh["skiparse_cp", "cp"]._flatten().get_group()
         skiparse_cp_group = dp_global_cp_mesh["skiparse_cp"].get_group()
-        cp_group = dp_global_cp_mesh["cp"].get_group()
+        # 初始化的时候full_blocks_cp_group和cp_group是同一个group
+        full_cp_group = cp_group = dp_global_cp_mesh["cp"].get_group()
         log_on_main_process(logger, f"We use context parrallel, global_cp_size: {global_cp_size}, cp_size: {cp_size}, skiparse_cp_size: {skiparse_cp_size}")
-        cp_state.reset(global_cp_group=global_cp_group, cp_group=cp_group, skiparse_cp_group=skiparse_cp_group)
+        cp_state.reset(global_cp_group=global_cp_group, cp_group=cp_group, skiparse_cp_group=skiparse_cp_group, full_cp_group=full_cp_group)
 
     if rank == 0:
         os.makedirs(output_dir, exist_ok=True)
