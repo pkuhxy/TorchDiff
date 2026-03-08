@@ -468,6 +468,10 @@ def scaled_dot_product_attention_with_mask(
             attn_mask = attn_mask.to(q.dtype)
         # [B, N] -> [B, 1, 1, N]，作为 key 侧 mask
         attn_mask = attn_mask[:, None, None, :]
+        # NPU需要接受 [B, 1, Nq, Nkv] 形状的mask
+        if is_npu_available():
+            q_len = q.shape[2]
+            attn_mask = attn_mask.expand(-1, -1, q_len, -1)
 
     out = torch.nn.functional.scaled_dot_product_attention(
         q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)

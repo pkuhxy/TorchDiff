@@ -41,8 +41,9 @@ class WanT2VDataset(BaseDataset):
         return_prompt_mask=True,
         **kwargs,
     ):
-        self.dataset_reader = LMDBReader(metafile_or_dir_path)
-        self.data_length = len(self.dataset_reader)
+        self.metafile_or_dir_path = metafile_or_dir_path
+        self._dataset_reader = None 
+        self.data_length = self._get_data_length()
         print(f'Build WanT2VDataset, data length: {self.data_length}...')
         
         self.sample_height = sample_height
@@ -79,14 +80,35 @@ class WanT2VDataset(BaseDataset):
             sample_stride=self.sample_stride,
         )
 
-        self.executor = ThreadPoolExecutor(max_workers=1)
-        self.timeout = kwargs.get("timeout", 600) 
+        self._executor = None
+        self.timeout = kwargs.get("timeout", 600)
 
+    def _get_data_length(self):
+        # 临时开一个 reader 获取长度后关掉
+        reader = LMDBReader(self.metafile_or_dir_path)
+        length = len(reader)
+        del reader
+        return length
+
+    @property
+    def dataset_reader(self):
+        # 每个 worker 进程第一次访问时才创建自己的 reader
+        # NOTE 重要：LMDB存在线程不安全的问题，一定要在worker内部初始化
+        if self._dataset_reader is None:
+            self._dataset_reader = LMDBReader(self.metafile_or_dir_path)
+        return self._dataset_reader
+
+    @property
+    def executor(self):
+        # 每个进程第一次用到时才创建，fork 后各自独立初始化
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(max_workers=1)
+        return self._executor
 
     def __getitem__(self, index):
         try:
-            future = self.executor.submit(self.getitem, index)
-            data = future.result(timeout=self.timeout) 
+            future = self.executor.submit(self.getitem, index)  # 通过 property 访问
+            data = future.result(timeout=self.timeout)
             return data
         except Exception as e:
             print(f"the error is {e}")

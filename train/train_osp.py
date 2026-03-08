@@ -66,6 +66,7 @@ def main(config):
     skiparse_1d = model_config.get("skiparse_1d", False)
     skiparse_2d = model_config.get("skiparse_2d", False)
     num_full_blocks = model_config.get("num_full_blocks", 0)
+    lock_main_parameters = model_config.get("lock_main_parameters", False)
 
     # data config
     data_config = config.get("data_config", {})
@@ -171,6 +172,8 @@ def main(config):
 
     if rank == 0:
         os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "config.yaml"), "w") as f:
+            yaml.dump(config, f, indent=4)
     
     set_seed(seed, device_specific=False) # for init
     # init model
@@ -232,6 +235,9 @@ def main(config):
             cp_state.reset(full_cp_group=full_cp_group)
 
     model.train()
+
+    if lock_main_parameters:
+        model.lock_main_parameters()
 
     # wrap model with fsdp2 mix-precision wrapper
     FSDP2_mix_wrapper(
@@ -407,11 +413,11 @@ def main(config):
     while current_iteration < training_iteration:
         if current_batch_nums % global_cp_size == 0:
             batch = next(dataloader_iter)
-            video = batch.pop(VIDEO, None).to(dtype=torch.float32, device=device)
-            prompt_ids = batch.pop(PROMPT_IDS, None).to(device=device)
-            prompt_mask = batch.pop(PROMPT_MASK, None).to(device=device)
+            video = batch.pop(VIDEO, None).to(dtype=torch.float32, device=device, non_blocking=True)
+            prompt_ids = batch.pop(PROMPT_IDS, None).to(device=device, non_blocking=True)
+            prompt_mask = batch.pop(PROMPT_MASK, None).to(device=device, non_blocking=True)
             
-            start_frame = batch.pop(START_FRAME, None).to(dtype=torch.float32, device=device) if "i2v" in task else None
+            start_frame = batch.pop(START_FRAME, None).to(dtype=torch.float32, device=device, non_blocking=True) if "i2v" in task else None
             with torch.no_grad():
                 latents = vae.encode(video)
                 start_frame_latents = vae.encode(start_frame) if "i2v" in task else None
@@ -490,8 +496,12 @@ def main(config):
             ema_model.update(model, current_iteration)
 
             if current_iteration % log_interval == 0:
+                tqdm_bar.set_postfix({
+                    "loss": gathered_avg_loss,
+                    "lr": optimizer.param_groups[0]['lr'],
+                    "grad_norm": grad_norm_after_clip.item()
+                }, refresh=False)  # 不立即刷新
                 tqdm_bar.update(log_interval)
-                tqdm_bar.set_postfix({"loss": gathered_avg_loss, "lr": optimizer.param_groups[0]['lr'], "grad_norm": grad_norm_after_clip.item()})
                 if rank == 0 and wandb.run is not None:
                     wandb_logs = {
                         "train/loss": gathered_avg_loss,

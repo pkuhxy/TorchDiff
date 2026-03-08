@@ -731,7 +731,8 @@ class SkiparseRopeWrapper:
         """
         x: (B, seq_len, num_heads, head_dim * 2)
         """
-        seq_len, num_heads, head_dim = x.size(1), x.size(2), x.size(3) // 2
+        B, seq_len, num_heads, head_dim = x.shape
+        head_dim = head_dim // 2
 
         x = x.to(self.real_dtype).reshape(-1, seq_len, num_heads, head_dim, 2)
         x1 = x[..., 0]   # (B, seq, heads, head_dim) # 实部
@@ -741,6 +742,19 @@ class SkiparseRopeWrapper:
         cos_f, sin_f = self.prepare_freqs(
             x, grid_sizes, head_dim, skiparse_rerrange, cp_type
         )
+
+        # cos_f/sin_f shape: (freqs_B, seq, 1, head_dim)
+        # x1/x2 shape:       (B,       seq, heads, head_dim)
+        # 当 skiparse rearrange 后 freqs_B = P²，x 的 B = P²*b
+        # 需要把 freqs repeat b 次对齐
+        freqs_B = cos_f.shape[0]
+        if freqs_B > 1 and B != freqs_B:
+            # B = P² * b, freqs_B = P²
+            assert B % freqs_B == 0, f"B={B} must be divisible by freqs_B={freqs_B}"
+            b = B // freqs_B
+            # (P², seq, 1, head_dim) -> (P²*b, seq, 1, head_dim)
+            cos_f = cos_f.repeat_interleave(b, dim=0)
+            sin_f = sin_f.repeat_interleave(b, dim=0)
 
         # 复数乘法的实数等价：
         # (x1 + x2·i)(cosθ + sinθ·i) = (x1·cos - x2·sin) + (x1·sin + x2·cos)·i
@@ -987,11 +1001,11 @@ class OSPNextAttentionBlock(nn.Module):
         if self.skiparse_block_type == SkiparseBlockType.Full:
             self.rearrange_input = SkiparseRearrange(rearrange_type=RearrangeType.Identity)
             self.rearrange_output = SkiparseRearrange(rearrange_type=RearrangeType.Identity)
-            self.text_rearrange_input = SkiparseRearrange(rearrange_type=RearrangeType.Identity)
+            self.context_rearrange_input = SkiparseRearrange(rearrange_type=RearrangeType.Identity)
             self.register_rearrange_input = SkiparseRearrange(rearrange_type=RearrangeType.Identity)
             self.register_rearrange_output = SkiparseRearrange(rearrange_type=RearrangeType.Identity)
         else:
-            self.text_rearrange_input = SkiparseRearrange(
+            self.context_rearrange_input = SkiparseRearrange(
                 sparse_ratio=self.sparse_ratio if self.skiparse_1d else self.sparse_ratio ** 2, 
                 rearrange_type=RearrangeType.Repeat
             )
@@ -1093,7 +1107,8 @@ class OSPNextAttentionBlock(nn.Module):
     ):
         # 对输入做rerrange
         x = self.rearrange_input(x, grid_sizes=sub_grid_sizes)
-        text = self.text_rearrange_input(text)
+        text = self.context_rearrange_input(text)
+        e = self.context_rearrange_input(e)
         register_tokens = self.register_rearrange_input(register_tokens)
 
         num_register_tokens = 0
@@ -1308,7 +1323,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
             sparse_ratio=self.sparse_ratio,
         )
 
-        self.use_full_blocks_context_parallel = \
+        self.need_full_blocks_context_parallel = \
             self.skiparse_model_type != SkiparseModelType.Full and \
             (self.skiparse_1d or self.skiparse_2d) and self.num_full_blocks > 0
 
@@ -1320,7 +1335,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
             print(f"sparse_ratio: {self.sparse_ratio}")
             print(f"num_full_blocks: {self.num_full_blocks}")
             print(f"num_register_tokens: {self.num_register_tokens}")
-            print(f"use_full_blocks_context_parallel: {self.use_full_blocks_context_parallel}")
+            print(f"need_full_blocks_context_parallel: {self.need_full_blocks_context_parallel}")
             print(f"full_block_indices: {self.full_block_indices}")
             print(f"=" * 20 + f"OSPNextModel init" + "=" * 20)
 
@@ -1336,6 +1351,8 @@ class OSPNextModel(ModelMixin, ConfigMixin):
 
     # lock main parameters except register tokens
     def lock_main_parameters(self):
+        if self.register_tokens is None or self.num_register_tokens <= 0:
+            raise ValueError(f"Register tokens is None! Cannot lock main parameters!")
         for name, param in self.named_parameters():
             if "register_tokens" in name:
                 continue
@@ -1351,7 +1368,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
 
         # params
         device = self.patch_embedding.weight.device
-        self.use_full_blocks_context_parallel = use_full_blocks_context_parallel() and self.use_full_blocks_context_parallel
+        self.use_full_blocks_context_parallel = use_full_blocks_context_parallel() and self.need_full_blocks_context_parallel
 
         # maybe we use meta device for init, so rope freqs should init before forward
         # buffers (don't use register_buffer otherwise dtype will be changed in to())

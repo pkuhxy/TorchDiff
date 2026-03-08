@@ -48,23 +48,24 @@ def skiparse_2d_single_reverse(x, grid_sizes=None, sparse_ratio=1):
 def skiparse_2d_group(x, grid_sizes=None, sparse_ratio=1):
     T, H, W = grid_sizes
     return rearrange(
-        x, 'b (t h p1 p2 w q1 q2) c -> (p1 q1 b) (t h p2 w q2) c',
-        p1=sparse_ratio, q1=sparse_ratio, p2=sparse_ratio, q2=sparse_ratio, h=H // (sparse_ratio ** 2), w=W // (sparse_ratio ** 2)
+        x, 'b (txh p1 p2 w q1 q2) c -> (p1 q1 b) (txh p2 w q2) c',
+        p1=sparse_ratio, q1=sparse_ratio, p2=sparse_ratio, q2=sparse_ratio, w=W // (sparse_ratio ** 2)
     )
 
 def skiparse_2d_group_reverse(x, grid_sizes=None, sparse_ratio=1):
     T, H, W = grid_sizes
     return rearrange(
-        x, '(p1 q1 b) (t h p2 w q2) c -> b (t h p1 p2 w q1 q2) c',
-        p1=sparse_ratio, q1=sparse_ratio, p2=sparse_ratio, q2=sparse_ratio, h=H // (sparse_ratio ** 2), w=W // (sparse_ratio ** 2)
+        x, '(p1 q1 b) (txh p2 w q2) c -> b (txh p1 p2 w q1 q2) c',
+        p1=sparse_ratio, q1=sparse_ratio, p2=sparse_ratio, q2=sparse_ratio, w=W // (sparse_ratio ** 2)
     )
 
 # single2group和group2single是完全互逆的，代码实现上是相同的
 def skiparse_2d_single_to_group(x, grid_sizes=None, sparse_ratio=1):
     T, H, W = grid_sizes
+    # x: 乘法 _: 除法
     return rearrange(
-        x, '(p2 q2 b) (t h_p1 p1 w_q1 q1) c -> (p1 q1 b) (t h_p1 p2 w_q1 q2) c',
-        p1=sparse_ratio, q1=sparse_ratio, p2=sparse_ratio, q2=sparse_ratio, h_p1=H // (sparse_ratio ** 2), w_q1=W // (sparse_ratio ** 2)
+        x, '(p2 q2 b) (txh_p1 p1 w_q1 q1) c -> (p1 q1 b) (txh_p1 p2 w_q1 q2) c',
+        p1=sparse_ratio, q1=sparse_ratio, p2=sparse_ratio, q2=sparse_ratio, w_q1=W // (sparse_ratio ** 2)
     )
 
 def skiparse_2d_group_to_single(x, grid_sizes=None, sparse_ratio=1):

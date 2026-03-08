@@ -5,7 +5,7 @@ import torch.distributed as dist
 from datetime import timedelta
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from typing import Iterable
-from torchdiff.utils.utils import str_to_precision, precision_to_str
+from torchdiff.utils.utils import str_to_precision, precision_to_str, int_to_precision, precision_to_int
 
 def setup_distributed_env(backend: str = "nccl", timeout: int = 3600):
     """ Initialize distributed environment. """
@@ -82,11 +82,11 @@ def broadcast_tensor_list(tensors, group_src=0, group=None):
 
         # broadcast tensor dtype
         if group_rank == group_src:
-            dtype_str = [precision_to_str(tensors[i].dtype)]
+            dtype_int = torch.tensor(precision_to_int(tensors[i].dtype), device=device, dtype=torch.int)
         else:
-            dtype_str = [None]
-        dist.broadcast_object_list(dtype_str, group=group, group_src=group_src)
-        dtype = str_to_precision(dtype_str[0])
+            dtype_int = torch.tensor(0, device=device, dtype=torch.int)
+        dist.broadcast(dtype_int, group=group, group_src=group_src)
+        dtype = int_to_precision(dtype_int.item())
 
         # broadcast tensor data
         if group_rank != group_src:
@@ -125,9 +125,9 @@ def gather_tensor_list_to_one(tensors, group_dst=0, group=None, active_ranks=Non
                     shape = tuple(shape.tolist())
 
                     # recv tensor dtype
-                    dtype_str = [None]
-                    dist.recv_object_list(dtype_str, group=group, group_src=r)
-                    dtype = str_to_precision(dtype_str[0])
+                    dtype_int = torch.tensor(0, device=device, dtype=torch.int)
+                    dist.recv(dtype_int, group=group, group_src=r)
+                    dtype = int_to_precision(dtype_int.item())
 
                     # recv tensor data
                     tensor = torch.empty(shape, device=device, dtype=dtype)
@@ -152,8 +152,8 @@ def gather_tensor_list_to_one(tensors, group_dst=0, group=None, active_ranks=Non
             dist.send(shape, group=group, group_dst=group_dst)
 
             # send tensor dtype
-            dtype_str = [precision_to_str(tensors[i].dtype)]
-            dist.send_object_list(dtype_str, group=group, group_dst=group_dst)
+            dtype_int = torch.tensor(precision_to_int(tensors[i].dtype), device=tensors[i].device, dtype=torch.int)
+            dist.send(dtype_int, group=group, group_dst=group_dst)
 
             # send tensor data
             dist.send(tensors[i], group=group, group_dst=group_dst)
