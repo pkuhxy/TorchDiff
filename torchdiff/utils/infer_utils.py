@@ -51,9 +51,6 @@ def load_prompts(prompt):
     if os.path.exists(prompt):
         with open(prompt, "r") as f:
             lines = f.readlines()
-            if len(lines) > 100:
-                print("The file has more than 100 lines of prompts, we can only proceed the first 100")
-                lines = lines[:100]
             prompts = [line.strip() for line in lines]
         return prompts
     else:
@@ -71,9 +68,6 @@ def load_images(image=None, dual_image=False, layout="CHW", array_type="torch"):
         else:
             with open(image, "r") as f:
                 lines = f.readlines()
-                if len(lines) > 100:
-                    print("The file has more than 100 lines of images, we can only process the first 100")
-                    lines = lines[:100]
                 if dual_image:
                     images = []
                     for line in lines:

@@ -4,6 +4,7 @@ import math
 import yaml
 from tqdm import tqdm
 import wandb
+from copy import deepcopy
 
 from torchdiff.utils.utils import check_and_import_npu, is_npu_available
 import torch
@@ -67,6 +68,7 @@ def main(config):
     skiparse_2d = model_config.get("skiparse_2d", False)
     num_full_blocks = model_config.get("num_full_blocks", 0)
     lock_main_parameters = model_config.get("lock_main_parameters", False)
+    training_with_full = model_config.get("training_with_full", False)
 
     # data config
     data_config = config.get("data_config", {})
@@ -290,6 +292,37 @@ def main(config):
     if not has_loaded_pretrained_model:
         log_on_main_process(f"warning! now we train from scratch, please make sure pretrained_model_dir_or_checkpoint={pretrained_model_dir_or_checkpoint} is correct!")
 
+    if training_with_full:
+        pretrained_full_model_dir_or_checkpoint = model_config.get("pretrained_full_model_dir_or_checkpoint", None)
+        if pretrained_full_model_dir_or_checkpoint is None or not os.path.exists(pretrained_full_model_dir_or_checkpoint):
+            raise ValueError(f"Training with full attn model, but pretrained_full_model_dir_or_checkpoint {pretrained_full_model_dir_or_checkpoint} not found!")
+        full_model_config = deepcopy(model_config)
+        full_model_config["skiparse_model_type"] = "full"
+        full_model_config["num_register_tokens"] = 0
+        with torch.device("meta"):
+            full_model = models[model_name](**full_model_config)
+        has_loaded_pretrained_full_model = False
+        if os.path.isdir(pretrained_full_model_dir_or_checkpoint):
+            log_on_main_process(logger, f"Load full attn model from pretrained_full_model_dir {pretrained_full_model_dir_or_checkpoint}")
+            full_model = models[model_name].from_pretrained(pretrained_full_model_dir_or_checkpoint)
+            has_loaded_pretrained_full_model = True
+        full_model.requires_grad_(False)
+        full_model.eval()
+        FSDP2_mix_wrapper(
+            full_model,
+            dp_mesh=ddp_fsdp_mesh,
+            weight_dtype=weight_dtype,
+            main_block_to_half=models_main_block[model_name],
+            blocks_to_float=models_blocks_to_float[model_name],
+            blocks_to_output_float=models_blocks_to_output_float[model_name],
+            reshard_after_forward=reshard_after_forward,
+            cpu_offload=model_cpu_offload,
+        )
+        if not has_loaded_pretrained_full_model and not os.path.isdir(pretrained_full_model_dir_or_checkpoint):
+            log_on_main_process(logger, f"Load full attn model from pretrained_full_model_checkpoint {pretrained_full_model_dir_or_checkpoint}")
+            checkpointer.load_model_from_path(full_model, pretrained_full_model_dir_or_checkpoint)
+            has_loaded_pretrained_full_model = True
+
     log_on_main_process(logger, "Initializing and loading optimizer checkpoint...")
     learning_rate = optimizer_config.get("lr", 1e-4)
     weight_decay = optimizer_config.get("weight_decay", 1e-2)
@@ -369,6 +402,7 @@ def main(config):
     Model has {params_nums_to_str(trainable_params_before_sharding)} trainable parameters and {params_nums_to_str(locked_params_before_sharding)} locked parameters
     After FSDP sharding,
     Model has {params_nums_to_str(trainable_params_after_sharding)} trainable parameters and {params_nums_to_str(locked_params_after_sharding)} locked parameters
+    Training with Full Attn Model: {training_with_full}
     Scheduler: {scheduler_config.get("scheduler_name", "flow_matching")}
     Dataset: {data_config.get("dataset_name", "t2v_random")}
     Sampler: {data_config.get("sampler_name", "stateful_distributed")}
@@ -479,8 +513,19 @@ def main(config):
                     text_embeddings,
                     start_frame_latents=start_frame_latents,
                 )
+                if training_with_full:
+                    full_model_output = full_model(
+                        interpolated_latents,
+                        timesteps,
+                        text_embeddings,
+                        start_frame_latents=start_frame_latents,
+                    )
 
-        loss = scheduler.training_losses(model_output, latents, prior_dist)[0]
+        if training_with_full:
+            # 最小化V_full和V_sparse
+            loss = torch.nn.functional.mse_loss(model_output.float(), full_model_output.float(), reduction='mean')
+        else:
+            loss = scheduler.training_losses(model_output, latents, prior_dist)[0]
         loss = loss / gradient_accumulation_steps # default value of gradient_accumulation_steps is 1
         loss.backward()
         loss_for_log = loss.clone().detach().unsqueeze(0)

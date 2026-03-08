@@ -1327,6 +1327,11 @@ class OSPNextModel(ModelMixin, ConfigMixin):
             self.skiparse_model_type != SkiparseModelType.Full and \
             (self.skiparse_1d or self.skiparse_2d) and self.num_full_blocks > 0
 
+        if self.skiparse_model_type == SkiparseModelType.Full:
+            self.main_cp_type = ContextParallelType.FullBlocksCP
+        else:
+            self.main_cp_type = ContextParallelType.CP
+
         if safe_get_rank() == 0:
             print(f"=" * 20 + f"OSPNextModel init" + "=" * 20)
             print(f"skiparse_model_type: {self.skiparse_model_type}")
@@ -1395,7 +1400,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
 
         # 计算shard_seq_lens，在all2all中用于恢复原序列长度
         full_shard_seq_lens, single_shard_seq_lens, group_shard_seq_lens = self.context_preprocessor.get_shard_seq_lens(
-            patchify_x_shape, grid_sizes, device=device, cp_type=ContextParallelType.CP
+            patchify_x_shape, grid_sizes, device=device, cp_type=self.main_cp_type
         )
         full_block_full_shard_seq_lens = full_shard_seq_lens
         if self.use_full_blocks_context_parallel:
@@ -1412,7 +1417,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
         
         x, sub_grid_sizes = self.context_preprocessor.preprocess(
             x, grid_sizes,
-            cp_type=ContextParallelType.CP if not self.use_full_blocks_context_parallel else ContextParallelType.FullBlocksCP
+            cp_type=self.main_cp_type if not self.use_full_blocks_context_parallel else ContextParallelType.FullBlocksCP
         )
 
         # text
@@ -1425,7 +1430,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
 
         # 最终还原postprocess的shard_seq_lens和cp_type
         final_shard_seq_lens = full_shard_seq_lens
-        final_cp_type = ContextParallelType.CP
+        final_cp_type = self.main_cp_type
         for idx, block in enumerate(self.blocks):
             # 如果是full2skiparse block，且采用了full blocks cp
             # 需要先在full blocks cp group中得到完整序列，再重新在cp group中shard
@@ -1434,7 +1439,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
                     x, grid_sizes, shard_seq_lens=full_block_full_shard_seq_lens, cp_type=ContextParallelType.FullBlocksCP
                 )
                 x, sub_grid_sizes = self.context_preprocessor.preprocess(
-                    x, grid_sizes, cp_type=ContextParallelType.CP
+                    x, grid_sizes, cp_type=self.main_cp_type
                 )
 
             if block.skiparse_block_type == SkiparseBlockType.Full:
@@ -1464,7 +1469,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
             if self.use_full_blocks_context_parallel:
                 if block.is_skiparse2full_block:
                     x = self.context_preprocessor.postprocess(
-                        x, grid_sizes, shard_seq_lens=full_shard_seq_lens, cp_type=ContextParallelType.CP
+                        x, grid_sizes, shard_seq_lens=full_shard_seq_lens, cp_type=self.main_cp_type
                     )
                     x, sub_grid_sizes = self.context_preprocessor.preprocess(
                         x, grid_sizes, cp_type=ContextParallelType.FullBlocksCP
