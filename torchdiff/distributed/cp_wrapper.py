@@ -113,7 +113,7 @@ if __name__ == "__main__":
     print("ddp_cp_mesh:", ddp_cp_mesh)
     set_seed(1024, device_specific=True, process_group=ddp_cp_mesh["ddp"].get_group())
 
-    model_name = "flashi2v"
+    model_name = "wan_t2v"
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     dtype = torch.float32
 

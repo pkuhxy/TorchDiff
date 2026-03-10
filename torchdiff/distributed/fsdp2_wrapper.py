@@ -122,7 +122,7 @@ if __name__ == "__main__":
     else:
         pretrained_model_dir = "/work/share1/checkpoint/Wan-AI/Wan2.1-T2V-1.3B/"
 
-    model_name = "flashi2v"
+    model_name = "wan_t2v"
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     dtype = torch.float32
 

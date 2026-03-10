@@ -39,3 +39,4 @@ poetry.lock
 *wandb/
 vbench*/
 output*/
+*.lmdb/

@@ -1,7 +1,4 @@
-# export WANDB_MODE="online"
-# export WANDB_API_KEY="720d886d8c437c2142c88056a1eab8ef78d64a1f"
-# wandb login $WANDB_API_KEY
-
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
 
 export TOKENIZERS_PARALLELISM=false
 
@@ -18,18 +15,18 @@ export HCCL_EXEC_TIMEOUT=0
 export ACL_DEVICE_SYNC_TIMEOUT=3600
 
 
-MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
-MASTER_PORT=${MASTER_PORT:-29501}
-NPRC_PER_NODE=${NPRC_PER_NODE:-8}
-NNODES=${PET_NNODES:-1}
-NODE_RANK=${RANK:-0}
-WORLD_SIZE=$(($NNODES * $NPRC_PER_NODE))
+# export CUDA_VISIBLE_DEVICES=0,1,2,3
 
+MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
+MASTER_PORT=${MASTER_PORT:-29505}
+NPRC_PER_NODE=${NPRC_PER_NODE:-8}
+NNODES=${NNODES:-1}
+WORLD_SIZE=$(($NNODES * $NPRC_PER_NODE))
 
 torchrun \
   --nproc_per_node=${NPRC_PER_NODE} \
   --nnodes=${NNODES} \
   --master_addr=${MASTER_ADDR} \
   --master_port=${MASTER_PORT} \
-  train/train_flashi2v.py \
-  --config configs/train/npu/flashi2v_1_3b.yaml
+  eval/eval_osp.py \
+  --config configs/eval/npu/osp_1_3b.yaml

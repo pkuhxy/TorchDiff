@@ -197,9 +197,11 @@ class T2VEvalDataset(BaseDataset):
         num_samples_per_prompt=1,
         **kwargs,
     ):
-        self.dataset_reader = LMDBReader(metafile_or_dir_path)
+        self.metafile_or_dir_path = metafile_or_dir_path
+        self._dataset_reader = None 
+        self.data_length = self._get_data_length()
         self.num_samples_per_prompt = num_samples_per_prompt
-        self.data_length = len(self.dataset_reader) * self.num_samples_per_prompt
+        self.data_length = self.data_length * self.num_samples_per_prompt
         print(f'Build T2VEvalDataset, data length: {self.data_length}...')
 
         self.sample_height = sample_height
@@ -207,17 +209,22 @@ class T2VEvalDataset(BaseDataset):
         self.sample_num_frames = sample_num_frames
         self.train_fps = train_fps
 
-        self.executor = ThreadPoolExecutor(max_workers=1)
-        self.timeout = kwargs.get("timeout", 60) 
+    def _get_data_length(self):
+        # 临时开一个 reader 获取长度后关掉
+        reader = LMDBReader(self.metafile_or_dir_path)
+        length = len(reader)
+        del reader
+        return length
+
+    @property
+    def dataset_reader(self):
+        # 每个 worker 进程第一次访问时才创建自己的 reader
+        # NOTE 重要：LMDB存在线程不安全的问题，一定要在worker内部初始化
+        if self._dataset_reader is None:
+            self._dataset_reader = LMDBReader(self.metafile_or_dir_path)
+        return self._dataset_reader
 
     def __getitem__(self, index):
-        # try:
-        #     future = self.executor.submit(self.getitem, index)
-        #     data = future.result(timeout=self.timeout) 
-        #     return data
-        # except Exception as e:
-        #     print(f"the error is {e}")
-        #     return self.__getitem__(np.random.randint(0, self.__len__() - 1))
         return self.getitem(index)
 
     def __len__(self):
@@ -236,7 +243,7 @@ class T2VEvalDataset(BaseDataset):
     def get_text_data(self, text):
         if not isinstance(text, list):
             text = [text]
-        text = [random.choice(text)][0]
+        text = random.choice(text)
         return text
 
 dataset = {

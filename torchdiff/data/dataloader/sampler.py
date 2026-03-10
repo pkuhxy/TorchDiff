@@ -30,6 +30,8 @@ class StatefulDistributedSampler(DistributedSampler, Stateful):
             self.g = torch.Generator()
             self.g.manual_seed(self.seed)
             self.generator_state = self.g.get_state()
+        else:
+            self.generator_state = None
 
         # create first epoch’s indices
         self.indices = self._get_indices()

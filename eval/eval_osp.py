@@ -1,18 +1,22 @@
 import os
 import yaml
+import math
 from argparse import ArgumentParser
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torchdiff.utils.utils import check_and_import_npu
 check_and_import_npu()
 
 from torch.distributed.device_mesh import init_device_mesh
 from transformers import AutoTokenizer
+from torchdata.stateful_dataloader import StatefulDataLoader
 
-from torchdiff.distributed.utils import setup_distributed_env, cleanup_distributed_env, gather_tensor_list_to_one
+from torchdiff.utils.constant import PROMPT, START_FRAME, NAME_INDEX
+from torchdiff.distributed.utils import setup_distributed_env, cleanup_distributed_env, gather_tensor_list_to_one, set_modules_to_forward_prefetch
 from torchdiff.distributed.fsdp2_wrapper import FSDP2_mix_wrapper
-from torchdiff.distributed.cp_wrapper import CP_wrapper
+from torchdiff.distributed.cp_state import cp_state
 from torchdiff.modules import (
     WanVAE, 
     T5EncoderModel, 
@@ -20,64 +24,15 @@ from torchdiff.modules import (
     models_main_block, 
     models_blocks_to_float,
     models_blocks_to_output_float,
-    models_cp_plans,
 )
 from torchdiff.schedulers import schedulers
 from torchdiff.distributed.checkpoint import Checkpointer
+from torchdiff.data import ultra_datasets, ultra_samplers, ultra_collators
 from torchdiff.utils.utils import str_to_precision, get_memory_allocated
 from torchdiff.utils.log_utils import get_logger, log_on_main_process
 from torchdiff.pipelines import pipelines
-from torchdiff.utils.infer_utils import load_prompts, load_images, save_videos, save_video_grid
-from torchdiff.utils.filter import HighFrequencyExtractor
+from torchdiff.utils.infer_utils import save_videos, save_video_with_name
 from torchdiff.utils.random_utils import set_seed
-
-class FlashI2VWrapper(nn.Module):
-    def __init__(
-        self, 
-        model, 
-        scheduler,
-        low_freq_energy_ratio=[0.05, 0.95],
-        fft_return_abs=True,
-    ):
-        super().__init__()
-        self.model = model
-        self.scheduler = scheduler
-        self.high_freq_extractor = HighFrequencyExtractor(
-            low_freq_energy_ratio=low_freq_energy_ratio,
-            return_abs=fft_return_abs,
-        )
-
-    def forward(
-        self,
-        latents,
-        timesteps,
-        text_embeddings,
-        start_frame_latents,
-        fourier_features=None,
-        start_frame_latents_proj=None,
-        **kwargs,
-    ):
-        weight_dtype = text_embeddings.dtype
-        
-        if fourier_features is None or start_frame_latents_proj is None:
-            fourier_features = self.high_freq_extractor(start_frame_latents.squeeze(2)).unsqueeze(2)
-            fourier_features = fourier_features.repeat(1, 1, latents.shape[2], 1, 1)
-            fourier_features = fourier_features.to(weight_dtype)
-
-            start_frame_latents_proj = self.model.learnable_proj(start_frame_latents)
-            assert start_frame_latents_proj.dtype == torch.float32
-
-        latents = latents - start_frame_latents_proj
-
-        with torch.autocast("cuda", dtype=weight_dtype):
-            model_output = self.model(
-                latents.to(weight_dtype),
-                timesteps,
-                text_embeddings,
-                fourier_features=fourier_features,
-            )
-
-        return dict(model_output=model_output, fourier_features=fourier_features, start_frame_latents_proj=start_frame_latents_proj)
 
 
 def main(config):
@@ -92,20 +47,29 @@ def main(config):
     vae_config = config.get("vae_config", {})
     text_encoder_config = config.get("text_encoder_config", {})
     scheduler_config = config.get("scheduler_config", {})
+    # skiparse相关
+    sparse_ratio = model_config.get("sparse_ratio", 1)
+    skiparse_1d = model_config.get("skiparse_1d", False)
+    skiparse_2d = model_config.get("skiparse_2d", False)
+    num_full_blocks = model_config.get("num_full_blocks", 0)
+
+    # data config
+    data_config = config.get("data_config", {})
 
     # inference config
     pipeline_name = config.get("pipeline_name", "t2v")
     weight_dtype = config.get("weight_dtype", "bfloat16")
     prompt_txt = config.get("prompt_txt", None)
-    image_txt = config.get("image_txt", None)
     batch_size = config.get("batch_size", 1)
     num_frames = config.get("num_frames", 49)
     height = config.get("height", 480)
     width = config.get("width", 832)
     save_fps = config.get("save_fps", 16)
     use_context_parallel = config.get("use_context_parallel", False)
+    use_skiparse_context_parallel = config.get("use_skiparse_context_parallel", False)
     reshard_after_forward = config.get("reshard_after_forward", None)
     model_cpu_offload = config.get("model_cpu_offload", False)
+    explicit_prefetching_num_blocks = config.get("explicit_prefetching_num_blocks", 0)
 
     # save config
     output_dir = config.get("output_dir", "./output")
@@ -129,27 +93,54 @@ def main(config):
     ddp_fsdp_mesh = init_device_mesh("cuda", (ddp_size, fsdp_size), mesh_dim_names=("ddp", "fsdp"))
     logger.info(f"rank {rank} use ddp mesh {ddp_fsdp_mesh['ddp']} and fsdp mesh {ddp_fsdp_mesh['fsdp']}")
 
+    # init fsdp config
+    fsdp_size = config.get("fsdp_size", 8)
+    if fsdp_size > world_size: 
+        fsdp_size = world_size
+        log_on_main_process(logger, f"Warning, GPU nums are not enough! FSDP size reset to {fsdp_size}!")
+    ddp_size = config.get("ddp_size", world_size // fsdp_size)
+    ddp_fsdp_mesh = init_device_mesh("cuda", (ddp_size, fsdp_size), mesh_dim_names=("ddp", "fsdp"))
+    logger.info(f"rank {rank} use ddp mesh {ddp_fsdp_mesh['ddp']} and fsdp mesh {ddp_fsdp_mesh['fsdp']}")
+
+    dp_group = dist.group.WORLD # use default world group
     # init cp mesh if use context parallel
-    dp_group = torch.distributed.group.WORLD
     cp_size = 1
-    cp_mesh = None
     use_context_parallel = use_context_parallel and config.get("cp_size", 1) > 1
-    if use_context_parallel:
-        # cp size == model parallel (FSDP) size
-        cp_size = config.get("cp_size", fsdp_size)
-        if cp_size == fsdp_size:
-            cp_mesh = ddp_fsdp_mesh["fsdp"]
-            dp_group = ddp_fsdp_mesh["ddp"].get_group()
-        # cp size != model parallel (FSDP) size
-        else:
-            dp_cp_mesh = init_device_mesh("cuda", (world_size // cp_size, cp_size), mesh_dim_names=("dp", "cp"))
-            cp_mesh = dp_cp_mesh["cp"]
-            dp_group = dp_cp_mesh["dp"].get_group()
-        log_on_main_process(logger, f"We use context parallel, cp_size: {cp_size}")
-        logger.info(f"rank {rank} use cp mesh {cp_mesh}")
+    # skiparse cp
+    skiparse_cp_size = 1
+    use_skiparse_context_parallel = use_skiparse_context_parallel and config.get("skiparse_cp_size", 1) > 1 and sparse_ratio > 1
+    use_global_context_parallel = use_context_parallel or use_skiparse_context_parallel
+    global_cp_size = 1
+    # full cp size
+    # 用于混合full attn blocks和skiparse blocks时对于full blocks采用的cp group
+    full_cp_size = 1
+    use_full_blocks_context_parallel = use_global_context_parallel and (skiparse_1d or skiparse_2d) and num_full_blocks > 0
+    # use_full_blocks_context_parallel = False
+    if use_global_context_parallel:
+        if use_context_parallel:
+            cp_size = config.get("cp_size", 1)
+        if use_skiparse_context_parallel:
+            skiparse_cp_size = config.get("skiparse_cp_size", 1)
+            if skiparse_1d:
+                assert skiparse_cp_size <= sparse_ratio and sparse_ratio % skiparse_cp_size == 0
+            elif skiparse_2d:
+                assert skiparse_cp_size <= sparse_ratio ** 2 and (sparse_ratio ** 2) % skiparse_cp_size == 0
+        global_cp_size = skiparse_cp_size * cp_size
+        # dp * skiparse_cp * cp = world_size
+        # 先skiparse_cp后cp，因为skiparse_cp的通信量更小
+        dp_global_cp_mesh = init_device_mesh("cuda", (world_size // global_cp_size, skiparse_cp_size, cp_size), mesh_dim_names=("dp", "skiparse_cp", "cp"))
+        dp_group = dp_global_cp_mesh["dp"].get_group()
+        global_cp_group = dp_global_cp_mesh["skiparse_cp", "cp"]._flatten().get_group()
+        skiparse_cp_group = dp_global_cp_mesh["skiparse_cp"].get_group()
+        # 初始化的时候full_blocks_cp_group和cp_group是同一个group
+        full_cp_group = cp_group = dp_global_cp_mesh["cp"].get_group()
+        log_on_main_process(logger, f"We use context parrallel, global_cp_size: {global_cp_size}, cp_size: {cp_size}, skiparse_cp_size: {skiparse_cp_size}")
+        cp_state.reset(global_cp_group=global_cp_group, cp_group=cp_group, skiparse_cp_group=skiparse_cp_group, full_cp_group=full_cp_group)
 
     if rank == 0:
         os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "config.yaml"), "w") as f:
+            yaml.dump(config, f, indent=4)
 
     log_on_main_process(logger, "Initializing VAE model...")
     vae = WanVAE(
@@ -188,24 +179,27 @@ def main(config):
     else:
         raise ValueError(f"In inference mode, pretrained_model_dir_or_checkpoint must be specified!")
 
-    if use_context_parallel and model.num_heads % cp_size != 0:
-        raise ValueError(f"When using context parallel, num_heads {model.num_heads} mush be mutiple of cp_size {cp_size}!")
-    
-    model.eval()
-    flashi2v_wrapper = FlashI2VWrapper(
-        model=model,
-        scheduler=scheduler,
-        low_freq_energy_ratio=model_config.get("low_freq_energy_ratio", 0.1),
-        fft_return_abs=model_config.get("fft_return_abs", True)
-    )
+    if use_context_parallel or use_full_blocks_context_parallel:
+        if use_context_parallel and model.num_heads % cp_size != 0:
+            raise ValueError(f"When using context parallel, num_heads {model.num_heads} mush be mutiple of cp_size {cp_size}!")
+        if use_full_blocks_context_parallel:
+            if global_cp_size <= model.num_heads and model.num_heads % global_cp_size == 0:
+                full_cp_size = global_cp_size
+            # 找到model.num_heads与global_cp_size的最大公约数
+            else:
+                gcd = math.gcd(model.num_heads, global_cp_size)
+                full_cp_size = gcd
+            # full_cp_size一定是global_cp_size的约数，而global_cp_size一定是world_size的约数
+            # 所以full_cp_group一定是global_cp_group的子集
+            dummy_mesh = init_device_mesh("cuda", (world_size // full_cp_size, full_cp_size), mesh_dim_names=("dummy", "full_cp"))
+            full_cp_group = dummy_mesh["full_cp"].get_group()
+            cp_state.reset(full_cp_group=full_cp_group)
 
-    # wrap model with cp wrapper if use context parallel
-    if use_context_parallel:
-        CP_wrapper(flashi2v_wrapper, models_cp_plans[model_name], cp_mesh=cp_mesh)
+    model.eval()
 
     # wrap model with fsdp2 mix-precision wrapper
     FSDP2_mix_wrapper(
-        flashi2v_wrapper,
+        model,
         dp_mesh=ddp_fsdp_mesh,
         weight_dtype=weight_dtype,
         main_block_to_half=models_main_block[model_name],
@@ -217,6 +211,9 @@ def main(config):
 
     log_on_main_process(logger, f"Diffusion model initialized, memory allocated: {get_memory_allocated()} GiB")
 
+    if explicit_prefetching_num_blocks > 0:
+        set_modules_to_forward_prefetch(model.blocks, num_to_forward_prefetch=explicit_prefetching_num_blocks)
+
     if not has_loaded_pretrained_model:
         model.to_empty(device=device)
         set_seed(seed, device_specific=False) # for init
@@ -224,78 +221,71 @@ def main(config):
 
     if pretrained_model_dir_or_checkpoint is not None and os.path.isfile(pretrained_model_dir_or_checkpoint):
         log_on_main_process(logger, f"Load model from pretrained_model_checkpoint {pretrained_model_dir_or_checkpoint}")
-        Checkpointer.load_model_from_path(flashi2v_wrapper.model, pretrained_model_dir_or_checkpoint, dcp_api=save_with_dcp_api)
+        Checkpointer.load_model_from_path(model, pretrained_model_dir_or_checkpoint, dcp_api=save_with_dcp_api)
+
+    # dataset
+    dataset = ultra_datasets[data_config.get("dataset_name", "t2v_eval")](**data_config.get("dataset_config", {}))
+
+    # sampler
+    dp_size = dp_group.size() 
+    dp_rank = torch.distributed.get_rank(dp_group)
+    sampler = ultra_samplers[data_config.get("sampler_name", "stateful_distributed")](
+        dataset, 
+        num_replicas=dp_size, # eval mode, we do not use encoder cache to be compatible with pipeline
+        rank=dp_rank, # eval mode, we do not use encoder cache to be compatible with pipeline
+        shuffle=False,
+        # consumed_samples=consumed_samples,
+        drop_last=False,
+    )
+    # dataloader
+    num_workers = data_config.get("num_workers", 16)
+    collator = ultra_collators[data_config.get("collator_name", "t2v_eval")](**data_config.get("collator_config", {}))
+    assert batch_size == 1, f"in eval mode, batch_size should be set to 1, but current batch_size is {batch_size}"
+    dataloader = StatefulDataLoader(
+        dataset,
+        batch_size=batch_size,
+        sampler=sampler,
+        collate_fn=collator,
+        num_workers=num_workers,
+        pin_memory=data_config.get("pin_memory", False),
+        generator=torch.Generator().manual_seed(seed + dp_rank)
+    )
 
     pipeline = pipelines[pipeline_name](
         vae=vae,
         tokenizer=tokenizer,
         text_encoder=text_encoder,
-        predictor=flashi2v_wrapper,
+        predictor=model,
         scheduler=scheduler
     )
 
-    prompts = load_prompts(prompt_txt)
-    conditional_images = load_images(image_txt)
-
-    assert len(prompts) == len(conditional_images), "In I2V mode, prompts num must be equal to conditional images num."
-
     set_seed(seed, device_specific=True, process_group=dp_group)
 
-    dp_rank = torch.distributed.get_rank(dp_group)
-    dp_size = torch.distributed.get_world_size(dp_group)
-    if cp_mesh is not None:
-        cp_rank = torch.distributed.get_rank(cp_mesh.get_group()) 
-        cp_size = torch.distributed.get_world_size(cp_mesh.get_group())
-    else:
-        cp_rank = 0
-        cp_size = 1
+    cp_rank = cp_state.global_cp_rank
+    cp_size = cp_state.global_cp_size
+    cp_group = cp_state.global_cp_group
 
-    if len(prompts) % dp_size > 0:
-        log_on_main_process(logger, f"Warning! Caused by using FSDP, we will pad some dummy data to make sure len(prompts) {len(prompts)} == dp_size {dp_size}"
-                                    f" and len(conditional_images) {len(conditional_images)} == dp_size {dp_size}.")
-        while len(prompts) % dp_size > 0:
-            prompts.append(prompts[0])
-            conditional_images.append(conditional_images[0])
-
-    video_grid = []
-    for index in range(dp_rank * batch_size, len(prompts), batch_size * dp_size):
-        batch_prompts = prompts[index: index + batch_size]
-        batch_images = conditional_images[index: index + batch_size]
+    iteration_nums = len(dataloader)
+    log_on_main_process(logger, f"we need to sample {iteration_nums} counts...")
+    dataloader_iter = iter(dataloader)
+    for _ in range(iteration_nums):
+        batch = next(dataloader_iter)
+        prompt = batch[PROMPT]
+        name_index = batch[NAME_INDEX]
+        print(f'processing {name_index}...')
         videos = pipeline(
-            prompt=batch_prompts,
-            conditional_image=batch_images,
+            prompt=prompt,
             num_frames=num_frames,
             height=height,
             width=width,
-            seed=seed,
             max_sequence_length=512,
             device=device
         )
         if cp_rank == 0:
-            save_videos(videos, index, output_dir, save_fps)
-            video_grid.append(videos)
-
-    if len(video_grid) > 0:
-        video_grid = torch.cat(video_grid, dim=0).to(device)
-
-    if len(prompts) < batch_size * dp_size:
-        active_ranks = range(len(prompts) // batch_size)
-    else:
-        active_ranks = range(dp_size)
-
-    active_ranks = [x * cp_size for x in active_ranks]
-    # torch.distributed.barrier()
-    gathered_videos = gather_tensor_list_to_one([video_grid], group_dst=0, active_ranks=active_ranks)
-    # torch.distributed.barrier()
-
-    if rank == 0:
-        video_grid = torch.cat(gathered_videos, dim=0)
-        save_video_grid(video_grid, output_dir, fps=save_fps)
-        print("Inference finished.")
-        print(f"Saved {video_grid.shape[0]} samples to {output_dir}")
+            for video, name in zip(videos, name_index):
+                save_video_with_name(video, name, output_dir, save_fps)
 
     cleanup_distributed_env()
-
 
 
 if __name__ == "__main__":
