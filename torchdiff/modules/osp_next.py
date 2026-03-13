@@ -253,8 +253,12 @@ class SkiparseRearrange(nn.Module):
             }[rt]
             if use_skiparse_context_parallel():
                 return parallel_fn(x, grid_sizes, sr)
-            x = self._skiparse_cp_gather(x)
-            return self._skiparse_cp_scatter(plain_fn(x, grid_sizes, sr))
+            return plain_fn(x, grid_sizes, sr)
+        
+        # TODO 1d single⇄group: parallel 快路径未实现，暂时用gather -> rearrange -> scatter代替
+        if rt in (RearrangeType.Skiparse1DSingle2Group, RearrangeType.Skiparse1DGroup2Single):
+            rearrange_func = self._SIMPLE_DISPATCH[rt]
+            return self._skiparse_cp_scatter(rearrange_func(self._skiparse_cp_gather(x), sparse_ratio=sr))
 
         return self._SIMPLE_DISPATCH[rt](x, grid_sizes, sr)
 

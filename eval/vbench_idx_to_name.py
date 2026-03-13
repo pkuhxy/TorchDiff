@@ -2,11 +2,11 @@ import os
 import glob
 import shutil
 
-sample_videos_dir = "samples/vbench/osp_next_1_3b_81f480p_sparse2d2_ssp2_training_with_full_seed666"
+sample_videos_dir = "samples/vbench/osp_next_1_3b_81f480p_sparse2d2_ssp2_from_full2k_seed666"
 videos = glob.glob(f"{sample_videos_dir}/*.mp4")
 
 idx_to_name_txt = "eval/idx2prompt.txt"
-save_dir = "samples/vbench_renamed/osp_next_1_3b_81f480p_sparse2d2_ssp2_training_with_full_seed666"
+save_dir = "samples/vbench_renamed/osp_next_1_3b_81f480p_sparse2d2_ssp2_from_full2k_seed666"
 os.makedirs(save_dir, exist_ok=True)
 with open(idx_to_name_txt, "r") as f:
     idx_to_name = {int(line.split('\t')[0]): line.split('\t')[1].strip() for line in f}
