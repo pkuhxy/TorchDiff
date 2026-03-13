@@ -359,6 +359,7 @@ def main(config):
         shuffle=data_config.get("shuffle", True),
         # consumed_samples=consumed_samples,
         drop_last=data_config.get("drop_last", True),
+        seed=seed, # 所有rank都用相同的seed传给sampler，sampler会先用该seed对序列random，然后再切分到rank
     )
     # dataloader
     num_workers = data_config.get("num_workers", 16)

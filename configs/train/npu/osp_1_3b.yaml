@@ -1,9 +1,9 @@
 # test yaml
 
 model_name: "osp_next"
-seed: 1024
+seed: 42
 
-output_dir: "output/osp_next_1_3b_81f480p_sparse2d2_ssp2_training_with_full"
+output_dir: "output/osp_next_1_3b_81f480p_sparse2d2_ssp2_from_full2k"
 
 training_iteration: 1000000
 # ddp_size: 1
@@ -27,7 +27,7 @@ profiling: False
 
 wandb_config:
   project_name: "osp_next"
-  exp_name: "osp_next_1_3b_81f480p_sparse2d2_ssp2_training_with_full"
+  exp_name: "osp_next_1_3b_81f480p_sparse2d2_ssp2_from_full2k"
 
 model_config:
   dim: 1536
@@ -45,8 +45,8 @@ model_config:
   skiparse_1d: False
   skiparse_2d: True
   lock_main_parameters: False
-  training_with_full: True
-  pretrained_model_dir_or_checkpoint: "/home/ma-user/work/gyy/TorchDiff/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"
+  training_with_full: False
+  pretrained_model_dir_or_checkpoint: "output/osp_next_1_3b_81f480p_sparse2d2_ssp2_training_with_full/iter_000002000/ema_model_state_dict.pt"
   pretrained_full_model_dir_or_checkpoint: "/home/ma-user/work/gyy/TorchDiff/Wan2.1-T2V-1.3B/diffusion_pytorch_model.safetensors"
 
 scheduler_config:

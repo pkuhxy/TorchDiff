@@ -97,7 +97,7 @@ def _parallel_skiparse_2d_single_to_group(x, grid_sizes, sparse_ratio, group, gr
     x = contiguous(x).view(group_size, G, G * b, base, C)
     recv = torch.empty_like(x)
     dist.all_to_all_single(
-        contiguous(recv), x,
+        recv, x,
         group=group,
     )
 

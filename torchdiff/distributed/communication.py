@@ -14,14 +14,10 @@ from torchdiff.utils.utils import contiguous
 
 def get_shard_seq_lens(input: torch.Tensor, group: dist.ProcessGroup):
     seq_world_size = dist.get_world_size(group)
-    local_shard_seq_len = torch.tensor(input.shape[1], dtype=torch.int32, device=input.device)
-    shard_seq_lens = [
-        torch.tensor(0, dtype=torch.int32, device=input.device) for _ in range(seq_world_size)
-    ]
-    dist.all_gather(shard_seq_lens, local_shard_seq_len, group=group)
-    shard_seq_lens = [lens.item() for lens in shard_seq_lens]
-    return shard_seq_lens
-
+    local_len = torch.tensor(input.shape[1], dtype=torch.int32, device=input.device)
+    all_lens = torch.empty(seq_world_size, dtype=torch.int32, device=input.device)
+    dist.all_gather_into_tensor(all_lens, local_len, group=group)
+    return all_lens.tolist()
 
 def _all_to_all_4D(
     input: torch.Tensor, scatter_idx: int = 2, gather_idx: int = 1, group: dist.ProcessGroup = None,
@@ -72,11 +68,8 @@ def _all_to_all_4D(
         dist.all_to_all_single(output, input_t, group=group)
         # if scattering the seq-dim, transpose the heads back to the original dimension
         # output shape: [bs, seq_world_size, max_shard_seq_len, shard_hc, hs]
-        output = contiguous(
-            output
-            .transpose(0, 2)
-            .transpose(1, 2)
-        )
+        output = output.transpose(0, 2).transpose(1, 2)
+            
         has_variable_len = any(s != max_shard_seq_len for s in shard_seq_lens)
         if has_variable_len:
             chunks = [
@@ -86,7 +79,7 @@ def _all_to_all_4D(
             output = torch.cat(chunks, dim=1)  # [bs, total_valid_seq, shard_hc, hs]
         else:
             output = output.reshape(bs, -1, shard_hc, hs)
-        return output
+        return contiguous(output)
 
     elif scatter_idx == 1 and gather_idx == 2:
         # input (torch.tensor): a tensor sharded along dim 1 (bs, seqlen, hc/P, hs) output: (bs, seqlen/P, hc, hs)
@@ -124,17 +117,13 @@ def _all_to_all_4D(
         dist.all_to_all_single(output, input_t, group=group)
 
         # (hc, seqlen/N, bs, hs) -tranpose(0,2)-> (bs, seqlen/N, hc, hs)
-        output = contiguous(
-            output
-            .reshape(hc, shard_seqlen, bs, hs)
-            .transpose(0, 2)
-        )
+        output = output.reshape(hc, shard_seqlen, bs, hs).transpose(0, 2)
 
         local_shard_seq_len = shard_seq_lens[dist.get_rank(group)]
         if local_shard_seq_len < max_shard_seq_len:
-            output = contiguous(output[:, :local_shard_seq_len])
+            output = output[:, :local_shard_seq_len]
 
-        return output
+        return contiguous(output)
 
     else:
         raise RuntimeError("scatter_idx must be 1 or 2 and gather_idx must be 1 or 2")
@@ -190,24 +179,34 @@ class _AllGather(torch.autograd.Function):
         world_size = dist.get_world_size(group)
         input_size = list(input_.size())
 
-        # 收集各 rank 在 dim 上的长度
-        local_input_size = torch.tensor(input_size[dim], dtype=torch.int32, device=input_.device)
-        global_input_sizes = [
-            torch.tensor(0, dtype=torch.int32, device=input_.device)
-            for _ in range(world_size)
-        ]
-        dist.all_gather(global_input_sizes, local_input_size, group=group)
-        dim_sizes = [size.item() for size in global_input_sizes]
+        local_dim_size = torch.tensor(
+            input_size[dim], dtype=torch.int32, device=input_.device
+        )
+        all_dim_sizes = torch.empty(
+            world_size, dtype=torch.int32, device=input_.device
+        )
+        dist.all_gather_into_tensor(all_dim_sizes, local_dim_size, group=group)
+
+        dim_sizes = all_dim_sizes.tolist()
         ctx.dim_sizes = dim_sizes
 
-        # 构建各 rank 的 tensor shape 并 all_gather
-        sizes = [input_size[:dim] + [dim_sizes[i]] + input_size[dim + 1:] for i in range(world_size)]
-        tensor_list = [
-            torch.empty(sizes[i], dtype=input_.dtype, device=input_.device)
-            for i in range(world_size)
-        ]
-        dist.all_gather(tensor_list, contiguous(input_), group=group)
+        all_same = all(s == dim_sizes[0] for s in dim_sizes)
 
+        if all_same:
+            tensor_list = [
+                torch.empty(input_size, dtype=input_.dtype, device=input_.device) 
+                for _ in range(world_size)
+            ]
+        else:
+            sizes = [
+                input_size[:dim] + [dim_sizes[i]] + input_size[dim + 1:]
+                for i in range(world_size)
+            ]
+            tensor_list = [
+                torch.empty(sizes[i], dtype=input_.dtype, device=input_.device)
+                for i in range(world_size)
+            ]
+        dist.all_gather(tensor_list, contiguous(input_), group=group)
         return contiguous(torch.cat(tensor_list, dim=dim))
 
     @staticmethod
@@ -215,12 +214,12 @@ class _AllGather(torch.autograd.Function):
         group = ctx.group
         dim = ctx.dim
         dim_sizes = ctx.dim_sizes
-        global_rank = cp_state.global_rank
-        rank = dist.get_group_rank(group, global_rank)
+        rank = dist.get_rank(group)
 
-        grad_input = torch.split(grad_outputs, dim_sizes, dim=dim)[rank]
+        offset = sum(dim_sizes[:rank])
+        grad_input = grad_outputs.narrow(dim, offset, dim_sizes[rank])
 
-        return grad_input, None, None
+        return contiguous(grad_input), None, None
 
 
 def all_gather(input_: torch.Tensor, dim: int = 1, group=None):
@@ -279,9 +278,7 @@ class _AllToAllSingle(torch.autograd.Function):
         if dim != 0:
             output = output.transpose(0, dim)
 
-        output = contiguous(output)
-
-        return output
+        return contiguous(output)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor):
@@ -317,9 +314,7 @@ class _AllToAllSingle(torch.autograd.Function):
         if dim != 0:
             grad_input = grad_input.transpose(0, dim)
 
-        grad_input = contiguous(grad_input)
-
-        return grad_input, None, None, None, None
+        return contiguous(grad_input), None, None, None, None
 
 
 def all_to_all_single(

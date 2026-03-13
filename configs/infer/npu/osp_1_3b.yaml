@@ -5,7 +5,7 @@ pipeline_name: "t2v"
 seed: 1024
 
 prompt_txt: "assets/t2v/MovieGenVideoBench_rewritten.txt"
-output_dir: "samples/osp_next_1_3b_81f480p_sparse2d2_ssp2_training_with_full/iter_000011000_ema"
+output_dir: "samples/osp_next_1_3b_81f480p_sparse2d2_ssp2_from_full5k/iter_000004000_ema"
 
 num_frames: 81
 height: 480
@@ -37,7 +37,7 @@ model_config:
   num_register_tokens: 0
   skiparse_1d: False
   skiparse_2d: True
-  pretrained_model_dir_or_checkpoint: "output/osp_next_1_3b_81f480p_sparse2d2_ssp2_training_with_full/iter_000011000/ema_model_state_dict.pt"
+  pretrained_model_dir_or_checkpoint: "output/osp_next_1_3b_81f480p_sparse2d2_ssp2_from_full5k/iter_000004000/ema_model_state_dict.pt"
 
 scheduler_config:
   scheduler_name: "flow_matching"

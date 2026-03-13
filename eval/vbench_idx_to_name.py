@@ -2,13 +2,14 @@ import os
 import glob
 import shutil
 
-videos = glob.glob("/work/share/projects/gyy/UltraI2V/samples/flashi2v_14b_vbench_49x480x832_camera/*.mp4")
+sample_videos_dir = "samples/vbench/osp_next_1_3b_81f480p_sparse2d2_ssp2_training_with_full_seed666"
+videos = glob.glob(f"{sample_videos_dir}/*.mp4")
 
-idx_to_name_txt = "/work/share/projects/gyy/UltraI2V/eval/vbench_idx_to_name_camera_motion.txt"
-save_dir = "/work/share/projects/gyy/UltraI2V/samples/flashi2v_14b_vbench_49x480x832_renamed4_camera"
+idx_to_name_txt = "eval/idx2prompt.txt"
+save_dir = "samples/vbench_renamed/osp_next_1_3b_81f480p_sparse2d2_ssp2_training_with_full_seed666"
 os.makedirs(save_dir, exist_ok=True)
 with open(idx_to_name_txt, "r") as f:
-    idx_to_name = {int(line.split('\t')[0]): line.split('\t')[1].strip().removesuffix('.jpg') for line in f}
+    idx_to_name = {int(line.split('\t')[0]): line.split('\t')[1].strip() for line in f}
 
 for video in videos:
     video_name = os.path.basename(video)

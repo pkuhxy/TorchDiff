@@ -536,19 +536,17 @@ class ContextParallelPreprocessor(MetaPreprocessor):
         if self.shard_seq_lens_cache.is_exist(key):
             return self.shard_seq_lens_cache.get(key)
         
-        cp_group, cp_rank, cp_size = cp_state.get_cp_infos_with_type(cp_type)
-
         _, N, _ = shape
         
         dummy = torch.ones((1, N, 1), dtype=torch.bool, device=device)
         dummy, sub_grid_sizes = self.preprocess(dummy, grid_sizes, cp_type=cp_type)
 
         if cp_type is None or cp_type == ContextParallelType.FullBlocksCP:
-            full_blocks_shard_seq_lens = get_shard_seq_lens(dummy, cp_group)
+            full_blocks_shard_seq_lens = get_shard_seq_lens(dummy, cp_state.full_cp_group)
             self.shard_seq_lens_cache.set(key, (full_blocks_shard_seq_lens, None, None))
             return full_blocks_shard_seq_lens, None, None
 
-        full_shard_seq_lens = get_shard_seq_lens(dummy, cp_group)
+        full_shard_seq_lens = get_shard_seq_lens(dummy, cp_state.cp_group)
 
         if self.is_skiparse_1d_model:
             single_rearrange_type = RearrangeType.Skiparse1DSingle
@@ -914,8 +912,6 @@ class OSPNextCrossAttention(OSPNextSelfAttention):
         x, 
         attn_mask,
         text,
-        num_register_tokens=0,
-        shard_seq_lens=None,
     ):
 
         B, N, H, D = *x.shape[:2], self.num_heads, self.head_dim
@@ -1082,8 +1078,6 @@ class OSPNextAttentionBlock(nn.Module):
             self.norm3(x), 
             cross_attn_mask,
             text, 
-            num_register_tokens=num_register_tokens, 
-            shard_seq_lens=shard_seq_lens,
         )
         y = self.ffn(self.norm2(x) * (1 + e[4]) + e[3])
         x = x + y * e[5]
