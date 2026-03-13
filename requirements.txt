@@ -1,5 +1,5 @@
-torch>=2.8.0
-torchvision>=0.23.0
+# torch>=2.8.0
+# torchvision>=0.23.0
 opencv-python>=4.9.0.80
 diffusers>=0.31.0
 transformers>=4.49.0
@@ -9,9 +9,10 @@ tqdm
 imageio
 easydict
 ftfy
+beautifulsoup4
 dashscope
 imageio-ffmpeg
-flash_attn
+# flash_attn
 gradio>=5.0.0
 numpy>=1.23.5,<2
 pyyaml
@@ -19,3 +20,5 @@ lmdb
 zstandard
 wandb
 torchdata
+
+# conda install cuda-toolkit=12.4 -c nvidia
