@@ -689,7 +689,7 @@ class SkiparseRopeWrapper:
             if skiparse_rerrange is not None
             else RearrangeType.Identity
         )
-        key = (T, H, W, rearrange_type, x.device)
+        key = (T, H, W, rearrange_type, cp_type, x.device)
 
         if self.cache.is_exist(key):
             return self.cache.get(key)

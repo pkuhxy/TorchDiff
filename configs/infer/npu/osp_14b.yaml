@@ -4,8 +4,8 @@ model_name: "osp_next"
 pipeline_name: "t2v"
 seed: 1024
 
-prompt_txt: "assets/t2v/simple_prompts.txt"
-output_dir: "samples/osp_next_14b_81f_720p"
+prompt_txt: "assets/t2v/MovieGenVideoBench_rewritten.txt"
+output_dir: "samples/osp_next_full_14b_81f_720p"
 
 num_frames: 81
 height: 720
@@ -14,10 +14,10 @@ save_fps: 16
 batch_size: 1
 
 fsdp_size: 8
-cp_size: 4
+cp_size: 2
 skiparse_cp_size: 4
 use_context_parallel: False
-use_skiparse_context_parallel: False
+use_skiparse_context_parallel: True
 reshard_after_forward: True
 explicit_prefetching_num_blocks: 2
 weight_dtype: "bf16"
@@ -32,13 +32,13 @@ model_config:
   num_layers: 40
   out_dim: 16
   text_len: 512
-  skiparse_model_type: "full"
+  skiparse_model_type: "dual_end"
   sparse_ratio: 2
   num_full_blocks: 8
   num_register_tokens: 0
   skiparse_1d: False
   skiparse_2d: True
-  pretrained_model_dir_or_checkpoint: "output/osp_next_14b_init"
+  pretrained_model_dir_or_checkpoint: "Wan2.1-T2V-14B/want2v_14b.pt"
 
 scheduler_config:
   scheduler_name: "flow_matching"
@@ -48,7 +48,7 @@ scheduler_config:
 
 vae_config:
   vae_path: "Wan2.1-T2V-14B/Wan2.1_VAE.pth"
-  dtype: "fp32"
+  dtype: "fp16"
 
 text_encoder_config:
   text_len: 512

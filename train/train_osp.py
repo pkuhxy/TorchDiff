@@ -124,6 +124,8 @@ def main(config):
     if fsdp_size > world_size: 
         fsdp_size = world_size
         log_on_main_process(logger, f"Warning, GPU nums are not enough! FSDP size reset to {fsdp_size}!")
+    elif world_size % fsdp_size != 0:
+        raise ValueError(f"world_size % fsdp_size != 0, fsdp error!")
     ddp_size = config.get("ddp_size", world_size // fsdp_size)
     ddp_fsdp_mesh = init_device_mesh("cuda", (ddp_size, fsdp_size), mesh_dim_names=("ddp", "fsdp"))
     logger.info(f"rank {rank} use ddp mesh {ddp_fsdp_mesh['ddp']} and fsdp mesh {ddp_fsdp_mesh['fsdp']}")
@@ -189,13 +191,19 @@ def main(config):
 
 
     log_on_main_process(logger, "Initializing text encoder model...")
+    # text_encoder的shard ranks数量默认为8
+    text_encoder_device_mesh = None
+    if text_encoder_config.get("use_fsdp", False):
+        num_replicate = max(world_size // 8, 1)
+        num_shard = world_size // num_replicate
+        text_encoder_device_mesh = init_device_mesh("cuda", (num_replicate, num_shard), mesh_dim_names=("replicate", "shard"))
     text_encoder = T5EncoderModel(
         text_len=text_encoder_config.get("text_len", 512),
         dtype=text_encoder_config.get("dtype", weight_dtype),
         device=device, # when no fsdp, we init the text_encoder on device
         checkpoint_path=text_encoder_config.get("checkpoint_path", None),
         use_fsdp=text_encoder_config.get("use_fsdp", False), # when using fsdp, we shard the text encoder by ddp_fsdp mesh
-        device_mesh=ddp_fsdp_mesh if text_encoder_config.get("use_fsdp", False) else None,
+        device_mesh=text_encoder_device_mesh,
     )
     log_on_main_process(logger, f"Text encoder model initialized, memory allocated: {get_memory_allocated()} GiB")
 

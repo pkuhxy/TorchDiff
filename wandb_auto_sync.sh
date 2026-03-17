@@ -1,5 +1,5 @@
 #!/bin/bash
-wandb_dir="/home/ma-user/work/gyy/TorchDiff/output/osp_next_1_3b_81f480p_sparse1d4_ssp2/wandb"
+wandb_dir="/home/ma-user/work/gyy/TorchDiff/output/osp_next_14b_81f720p_sparse2d2_ssp4/wandb"
 
 while true; do
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] syncing..."
