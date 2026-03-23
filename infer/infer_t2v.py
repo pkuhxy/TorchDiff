@@ -229,7 +229,7 @@ def main(config):
 
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--config", type=str, default="./configs/t2v.yaml")
+    parser.add_argument("--config", type=str, default="/home/ma-user/work/xianyi/osp_next/TorchDiff/configs/infer/npu/t2v_1_3b.yaml")
     args = parser.parse_args()
     if not os.path.exists(args.config):
         raise ValueError

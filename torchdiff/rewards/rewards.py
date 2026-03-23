@@ -407,8 +407,8 @@ def unifiedreward_score_sglang(device):
     
     return _fn
 
-def vbench_aesthetic_quality_score(device):
-    from torchdiff.rewards.vbench_aesthetic_quality import VBenchAestheticQualityScorer
+def aesthetic_quality_score(device):
+    from torchdiff.rewards.aesthetic_quality import VBenchAestheticQualityScorer
 
     scorer = VBenchAestheticQualityScorer(device=device)
 
@@ -416,13 +416,22 @@ def vbench_aesthetic_quality_score(device):
         if isinstance(images, torch.Tensor):
             images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
             images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
+        elif isinstance(images, np.ndarray):
+            if images.ndim == 4 and images.shape[1] == 3:
+                # (B, C, H, W) -> (B, H, W, C)
+                images = images.transpose(0, 2, 3, 1)
+            elif images.ndim == 5 and images.shape[1] == 3:
+                # (B, C, T, H, W) -> (B, T, H, W, C)
+                images = images.transpose(0, 2, 3, 4, 1)
+            if images.dtype != np.uint8:
+                images = np.clip(images * 255, 0, 255).astype(np.uint8)
         scores = scorer(images, prompts)
         return scores, {}
 
     return _fn
 
-def vbench_dynamic_degree_score(device):
-    from torchdiff.rewards.vbench_dynamic_degree import VBenchDynamicDegreeScorer
+def dynamic_degree_score(device):
+    from torchdiff.rewards.dynamic_degree import VBenchDynamicDegreeScorer
 
     scorer = VBenchDynamicDegreeScorer(device=device)
 
@@ -433,15 +442,24 @@ def vbench_dynamic_degree_score(device):
             elif images.dim() == 5 and images.shape[2] == 3:
                 images = images.permute(0, 1, 3, 4, 2)
             images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+        elif isinstance(images, np.ndarray):
+            if images.ndim == 4 and images.shape[1] == 3:
+                # (B, C, H, W) -> (B, H, W, C)
+                images = images.transpose(0, 2, 3, 1)
+            elif images.ndim == 5 and images.shape[1] == 3:
+                # (B, C, T, H, W) -> (B, T, H, W, C)
+                images = images.transpose(0, 2, 3, 4, 1)
+            if images.dtype != np.uint8:
+                images = np.clip(images * 255, 0, 255).astype(np.uint8)
         scores = scorer(images, prompts)
         return scores, {}
 
     return _fn
 
-def vbench_subject_consistency_score(device):
-    from torchdiff.rewards.vbench_subject_consistency import VBenchSubjectConsistencyScorer
+def subject_consistency_score(device):
+    from torchdiff.rewards.subject_consistency import VBenchSubjectConsistencyScorer
 
-    scorer = VBenchSubjectConsistencyScorer(device=device)
+    scorer = VBenchSubjectConsistencyScorer(device=device,dino_model_path="/home/ma-user/work/xianyi/ckpts/facebook/dinov2-base")
 
     def _fn(images, prompts, metadata):
         if isinstance(images, torch.Tensor):
@@ -450,13 +468,22 @@ def vbench_subject_consistency_score(device):
             elif images.dim() == 5 and images.shape[2] == 3:
                 images = images.permute(0, 1, 3, 4, 2)
             images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+        elif isinstance(images, np.ndarray):
+            if images.ndim == 4 and images.shape[1] == 3:
+                # (B, C, H, W) -> (B, H, W, C)
+                images = images.transpose(0, 2, 3, 1)
+            elif images.ndim == 5 and images.shape[1] == 3:
+                # (B, C, T, H, W) -> (B, T, H, W, C)
+                images = images.transpose(0, 2, 3, 4, 1)
+            if images.dtype != np.uint8:
+                images = np.clip(images * 255, 0, 255).astype(np.uint8)
         scores = scorer(images, prompts)
         return scores, {}
 
     return _fn
 
-def vbench_overall_consistency_score(device):
-    from torchdiff.rewards.vbench_overall_consistency import VBenchOverallConsistencyScorer
+def overall_consistency_score(device):
+    from torchdiff.rewards.overall_consistency import VBenchOverallConsistencyScorer
 
     scorer = VBenchOverallConsistencyScorer(device=device)
 
@@ -467,6 +494,15 @@ def vbench_overall_consistency_score(device):
             elif images.dim() == 5 and images.shape[2] == 3:
                 images = images.permute(0, 1, 3, 4, 2)
             images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+        elif isinstance(images, np.ndarray):
+            if images.ndim == 4 and images.shape[1] == 3:
+                # (B, C, H, W) -> (B, H, W, C)
+                images = images.transpose(0, 2, 3, 1)
+            elif images.ndim == 5 and images.shape[1] == 3:
+                # (B, C, T, H, W) -> (B, T, H, W, C)
+                images = images.transpose(0, 2, 3, 4, 1)
+            if images.dtype != np.uint8:
+                images = np.clip(images * 255, 0, 255).astype(np.uint8)
         scores = scorer(images, prompts)
         return scores, {}
 
@@ -478,7 +514,10 @@ def hps_score(device):
     scorer = HPSScorer(device=device, hps_version="v2.1")
 
     def _fn(images, prompts, metadata):
+
+        import pdb;pdb.set_trace()
         if isinstance(images, torch.Tensor):
+
             images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
             images = images.transpose(0, 2, 3, 1)  # NCHW -> NHWC
             images = [Image.fromarray(image) for image in images]
@@ -499,6 +538,17 @@ def video_hps_score(device):
             elif images.dim() == 5 and images.shape[2] == 3:
                 images = images.permute(0, 1, 3, 4, 2)
             images = (images * 255).round().clamp(0, 255).to(torch.uint8).cpu().numpy()
+        elif isinstance(images, np.ndarray):
+            # Handle numpy arrays with channel-first layout (e.g. from .cpu().numpy())
+            if images.ndim == 4 and images.shape[1] == 3:
+                # (B, C, H, W) -> (B, H, W, C)
+                images = images.transpose(0, 2, 3, 1)
+            elif images.ndim == 5 and images.shape[1] == 3:
+                # (B, C, T, H, W) -> (B, T, H, W, C)
+                images = images.transpose(0, 2, 3, 4, 1)
+            # Convert float [0, 1] to uint8 [0, 255] if needed
+            if images.dtype != np.uint8:
+                images = np.clip(images * 255, 0, 255).astype(np.uint8)
         scores = scorer(images, prompts)
         return scores, {}
 
@@ -518,10 +568,10 @@ def multi_score(device, score_dict):
         "geneval": geneval_score,
         "clipscore": clip_score,
         "image_similarity": image_similarity_score,
-        "vbench_aesthetic": vbench_aesthetic_quality_score,
-        "vbench_dynamic": vbench_dynamic_degree_score,
-        "vbench_subject_consistency": vbench_subject_consistency_score,
-        "vbench_overall_consistency": vbench_overall_consistency_score,
+        "aesthetic_quality": aesthetic_quality_score,
+        "dynamic": dynamic_degree_score,
+        "subject_consistency": subject_consistency_score,
+        "overall_consistency": overall_consistency_score,
         "hps": hps_score,
         "video_hps": video_hps_score,
     }
@@ -555,6 +605,8 @@ def multi_score(device, score_dict):
             else:
                 total_scores = [total + weighted for total, weighted in zip(total_scores, weighted_scores)]
         
+        # import pdb;pdb.set_trace()
+
         score_details['avg'] = total_scores
         return score_details, {}
 

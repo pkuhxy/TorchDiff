@@ -8,6 +8,13 @@ Output: list of float rewards
 """
 
 import os
+
+os.environ["OPENBLAS_NUM_THREADS"] = "16"  # 限制在 128 以下，通常 8 或 16 性能最好
+os.environ["OMP_NUM_THREADS"] = "16"
+os.environ["MKL_NUM_THREADS"] = "16"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "16"
+os.environ["NUMEXPR_NUM_THREADS"] = "16"
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -30,7 +37,7 @@ class VBenchOverallConsistencyScorer:
         cache_dir = os.environ.get("VBENCH_CACHE_DIR", os.path.expanduser("~/.cache/vbench"))
         
         if viclip_pretrain_path is None:
-            viclip_pretrain_path = "/apdcephfs_tj5/share_303570626/xianyihe/ckpts/OpenGVLab/ViCLIP/ViClip-InternVid-10M-FLT.pth"
+            viclip_pretrain_path = "/home/ma-user/work/xianyi/ckpts/OpenGVLab/ViCLIP/ViClip-InternVid-10M-FLT.pth"
         
         # Import ViCLIP from local third_party
         try:
@@ -42,7 +49,7 @@ class VBenchOverallConsistencyScorer:
             from third_party.ViCLIP.viclip import ViCLIP
             from third_party.ViCLIP.simple_tokenizer import SimpleTokenizer
         
-        tokenizer_path = "/apdcephfs_tj5/share_303570626/xianyihe/ckpts/OpenGVLab/ViCLIP/bpe_simple_vocab_16e6.txt.gz"
+        tokenizer_path = "/home/ma-user/work/xianyi/ckpts/OpenGVLab/ViCLIP/bpe_simple_vocab_16e6.txt.gz"
         self.tokenizer = SimpleTokenizer(tokenizer_path)
         
         self.model = ViCLIP(
@@ -169,7 +176,7 @@ class VBenchOverallConsistencyScorer:
 
 
 if __name__ == "__main__":
-    scorer = VBenchOverallConsistencyScorer(device="cuda")
+    scorer = VBenchOverallConsistencyScorer(device="cpu")
     frames = [np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8) for _ in range(8)]
     video = np.stack(frames)
     reward = scorer([video], ["a cat playing with a ball"])

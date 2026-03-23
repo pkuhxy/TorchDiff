@@ -164,7 +164,7 @@ class VBenchAestheticQualityScorer:
 
 
 if __name__ == "__main__":
-    scorer = VBenchAestheticQualityScorer(device="cuda", cache_dir="/apdcephfs_tj5/share_303570626/xianyihe/osp-next/TorchDiff/torchdiff/rewards/third_party/aesthetic")
+    scorer = VBenchAestheticQualityScorer(device="cpu")
     test_image = Image.new("RGB", (512, 512), (128, 128, 200))
     reward = scorer([test_image], ["a beautiful landscape"])
     print(f"Aesthetic Quality Reward: {reward}")

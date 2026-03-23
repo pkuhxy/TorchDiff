@@ -190,6 +190,19 @@ class _AllGather(torch.autograd.Function):
         dim_sizes = all_dim_sizes.tolist()
         ctx.dim_sizes = dim_sizes
 
+        # Debug: check for corrupted dim sizes
+        if any(s <= 0 for s in dim_sizes):
+            rank = dist.get_rank()
+            import traceback
+            print(f"[RANK {rank}] ERROR: corrupted dim_sizes in all_gather: {dim_sizes}, "
+                  f"local_dim_size={input_size[dim]}, input_shape={input_size}, dim={dim}, "
+                  f"group_size={world_size}, group_rank={dist.get_rank(group)}")
+            print(f"[RANK {rank}] all_dim_sizes raw tensor: {all_dim_sizes}")
+            mem_alloc = torch.cuda.memory_allocated() / 1024**3
+            mem_reserved = torch.cuda.memory_reserved() / 1024**3
+            print(f"[RANK {rank}] mem_alloc={mem_alloc:.2f}GiB, mem_reserved={mem_reserved:.2f}GiB")
+            traceback.print_stack()
+
         all_same = all(s == dim_sizes[0] for s in dim_sizes)
 
         if all_same:

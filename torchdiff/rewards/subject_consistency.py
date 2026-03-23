@@ -145,7 +145,7 @@ class VBenchSubjectConsistencyScorer:
 
 
 if __name__ == "__main__":
-    scorer = VBenchSubjectConsistencyScorer(device="cuda", dino_model_path="/apdcephfs_tj5/share_303570626/xianyihe/ckpts/facebook/dinov2-base")
+    scorer = VBenchSubjectConsistencyScorer(device="cpu", dino_model_path="/home/ma-user/work/xianyi/ckpts/facebook/dinov2-base")
     # Simulate a 4-frame video
     frames = [np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8) for _ in range(4)]
     video = np.stack(frames)  # (4, 256, 256, 3)

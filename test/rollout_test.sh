@@ -1,0 +1,1 @@
+torchrun --nproc_per_node=1 test/rollout_test.py --config /home/ma-user/work/xianyi/osp_next/TorchDiff/configs/infer/npu/t2v_1_3b.yaml --save_video --compare_ode --compare_deterministic

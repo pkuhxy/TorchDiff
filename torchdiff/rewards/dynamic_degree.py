@@ -30,7 +30,7 @@ class VBenchDynamicDegreeScorer:
         
         if raft_model_path is None:
             cache_dir = os.environ.get("VBENCH_CACHE_DIR", os.path.expanduser("~/.cache/vbench"))
-            raft_model_path = "/apdcephfs_tj5/share_303570626/xianyihe/ckpts/iic/cv_dut-raft_video-stabilization_base/ckpt/raft-things.pth"
+            raft_model_path = "/home/ma-user/work/xianyi/ckpts/iic/cv_dut-raft_video-stabilization_base/ckpt/raft-things.pth"
         
         # Import RAFT from local third_party
         try:
@@ -206,7 +206,7 @@ class VBenchDynamicDegreeScorer:
 
 
 if __name__ == "__main__":
-    scorer = VBenchDynamicDegreeScorer(device="cuda")
+    scorer = VBenchDynamicDegreeScorer(device="cpu")
     # Simulate a 4-frame video with some motion
     frames = [np.random.randint(0, 255, (256, 256, 3), dtype=np.uint8) for _ in range(4)]
     video = np.stack(frames)  # (4, 256, 256, 3)
