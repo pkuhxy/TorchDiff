@@ -5,10 +5,13 @@ import torch.distributed as dist
 from datetime import timedelta
 from torch.distributed.tensor import DTensor, Replicate, Shard
 from typing import Iterable
-from torchdiff.utils.utils import str_to_precision, precision_to_str, int_to_precision, precision_to_int
+from torchdiff.utils.utils import str_to_precision, precision_to_str, int_to_precision, precision_to_int, is_npu_available
 
-def setup_distributed_env(backend: str = "nccl", timeout: int = 3600):
+def setup_distributed_env(backend: str = None, timeout: int = 3600):
     """ Initialize distributed environment. """
+    if backend is None:
+        gpu_backend = "npu:hccl" if is_npu_available() else "cuda:nccl"
+        backend = f"cpu:gloo,{gpu_backend}"
     dist.init_process_group(backend=backend, timeout=timedelta(seconds=timeout))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     torch.cuda.set_device(local_rank)

@@ -86,6 +86,7 @@ def main(config):
     weight_dtype = config.get("weight_dtype", "bfloat16")
     reshard_after_forward = config.get("reshard_after_forward", None)
     model_cpu_offload = config.get("model_cpu_offload", False)
+    encoder_cpu_offload = config.get("encoder_cpu_offload", False)
     ema_decay = config.get("ema_decay", 0.9999)
     ema_update_interval = config.get("ema_update_interval", 1)
     explicit_prefetching_num_blocks = config.get("explicit_prefetching_num_blocks", 0)
@@ -124,6 +125,8 @@ def main(config):
     if fsdp_size > world_size: 
         fsdp_size = world_size
         log_on_main_process(logger, f"Warning, GPU nums are not enough! FSDP size reset to {fsdp_size}!")
+    elif world_size % fsdp_size != 0:
+        raise ValueError(f"world_size % fsdp_size != 0, fsdp error!")
     ddp_size = config.get("ddp_size", world_size // fsdp_size)
     ddp_fsdp_mesh = init_device_mesh("cuda", (ddp_size, fsdp_size), mesh_dim_names=("ddp", "fsdp"))
     logger.info(f"rank {rank} use ddp mesh {ddp_fsdp_mesh['ddp']} and fsdp mesh {ddp_fsdp_mesh['fsdp']}")
@@ -179,7 +182,7 @@ def main(config):
     
     set_seed(seed, device_specific=False) # for init
     # init model
-    log_on_main_process(logger, "Initializing VAE model...")
+    log_on_main_process(logger, f"Initializing VAE model with dtype: {str_to_precision(vae_config.get('dtype', 'fp32'))} ...")
     vae = WanVAE(
         vae_pth=vae_config.get("vae_path", None),
         dtype=str_to_precision(vae_config.get("dtype", "fp32")),
@@ -188,22 +191,31 @@ def main(config):
     log_on_main_process(logger, f"VAE model initialized, memory allocated: {get_memory_allocated()} GiB")
 
 
-    log_on_main_process(logger, "Initializing text encoder model...")
+    log_on_main_process(logger, f"Initializing text encoder model with dtype: {weight_dtype} ...")
+    # text_encoder的shard ranks数量默认为8
+    text_encoder_device_mesh = None
+    if text_encoder_config.get("use_fsdp", False):
+        num_replicate = max(world_size // 8, 1)
+        num_shard = world_size // num_replicate
+        text_encoder_device_mesh = init_device_mesh("cuda", (num_replicate, num_shard), mesh_dim_names=("replicate", "shard"))
     text_encoder = T5EncoderModel(
         text_len=text_encoder_config.get("text_len", 512),
-        dtype=text_encoder_config.get("dtype", weight_dtype),
+        dtype=weight_dtype,
         device=device, # when no fsdp, we init the text_encoder on device
         checkpoint_path=text_encoder_config.get("checkpoint_path", None),
         use_fsdp=text_encoder_config.get("use_fsdp", False), # when using fsdp, we shard the text encoder by ddp_fsdp mesh
-        device_mesh=ddp_fsdp_mesh if text_encoder_config.get("use_fsdp", False) else None,
+        device_mesh=text_encoder_device_mesh,
     )
     log_on_main_process(logger, f"Text encoder model initialized, memory allocated: {get_memory_allocated()} GiB")
 
-    # vae.to(device)
-    # if not text_encoder_config.get("use_fsdp", False):
-    #     text_encoder.to(device)
-    # vae.requires_grad_(False) # in vae
-    # text_encoder.requires_grad_(False) # in text_encoder
+    text_encoder_use_fsdp = text_encoder_config.get("use_fsdp", False)
+    if encoder_cpu_offload:
+        log_on_main_process(logger, "Offloading VAE and text encoder to CPU to save GPU memory...")
+        vae.model.to("cpu")
+        if not text_encoder_use_fsdp:
+            text_encoder.model.to("cpu")
+        torch.cuda.empty_cache()
+        log_on_main_process(logger, f"After encoder CPU offload, memory allocated: {get_memory_allocated()} GiB")
 
     log_on_main_process(logger, "Initializing diffusion model and scheduler...")
 
@@ -215,6 +227,9 @@ def main(config):
         log_on_main_process(logger, f"Load model from pretrained_model_dir {pretrained_model_dir_or_checkpoint}")
         model = models[model_name].from_pretrained(pretrained_model_dir_or_checkpoint)
         has_loaded_pretrained_model = True
+        if model_cpu_offload:
+            log_on_main_process(logger, "Moving pretrained model to CPU for FSDP CPU offloading...")
+            model.to("cpu")
     else:
         log_on_main_process(logger, f"Init model from scratch")
         with torch.device("meta"):
@@ -254,7 +269,8 @@ def main(config):
     )
 
     if not has_loaded_pretrained_model:
-        model.to_empty(device=device)
+        init_device = "cpu" if model_cpu_offload else device
+        model.to_empty(device=init_device)
         set_seed(seed, device_specific=False) # for init
         model.reset_parameters() # we should call reset_parameters because we init model at meta device 
 
@@ -306,6 +322,9 @@ def main(config):
             log_on_main_process(logger, f"Load full attn model from pretrained_full_model_dir {pretrained_full_model_dir_or_checkpoint}")
             full_model = models[model_name].from_pretrained(pretrained_full_model_dir_or_checkpoint)
             has_loaded_pretrained_full_model = True
+            if model_cpu_offload:
+                log_on_main_process(logger, "Moving pretrained full model to CPU for FSDP CPU offloading...")
+                full_model.to("cpu")
         full_model.requires_grad_(False)
         full_model.eval()
         FSDP2_mix_wrapper(
@@ -421,6 +440,7 @@ def main(config):
     Weight dtype: {weight_dtype}
     Reshard after forward: {reshard_after_forward}
     Model CPU offload: {model_cpu_offload}
+    Encoder CPU offload: {encoder_cpu_offload}
     EMA decay: {ema_decay} (update every {ema_update_interval} step)
     Random seed: {seed}
     Training iterations: {training_iteration}
@@ -447,6 +467,11 @@ def main(config):
 
     while current_iteration < training_iteration:
         if current_batch_nums % global_cp_size == 0:
+            if encoder_cpu_offload:
+                vae.model.to(device)
+                if not text_encoder_use_fsdp:
+                    text_encoder.model.to(device)
+
             batch = next(dataloader_iter)
             video = batch.pop(VIDEO, None).to(dtype=torch.float32, device=device, non_blocking=True)
             prompt_ids = batch.pop(PROMPT_IDS, None).to(device=device, non_blocking=True)
@@ -462,6 +487,12 @@ def main(config):
                     text_embeds_list=[text_embeddings],
                     step=current_batch_nums
                 )
+
+            if encoder_cpu_offload:
+                vae.model.to("cpu")
+                if not text_encoder_use_fsdp:
+                    text_encoder.model.to("cpu")
+                torch.cuda.empty_cache()
         else:
             vae_latents_list, text_embeds_list = encoder_cache_manager(step=current_batch_nums)
         latents = vae_latents_list[0]

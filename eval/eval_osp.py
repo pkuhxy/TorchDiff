@@ -221,7 +221,7 @@ def main(config):
 
     if pretrained_model_dir_or_checkpoint is not None and os.path.isfile(pretrained_model_dir_or_checkpoint):
         log_on_main_process(logger, f"Load model from pretrained_model_checkpoint {pretrained_model_dir_or_checkpoint}")
-        Checkpointer.load_model_from_path(model, pretrained_model_dir_or_checkpoint, dcp_api=save_with_dcp_api)
+        Checkpointer(folder=output_dir, dcp_api=save_with_dcp_api).load_model_from_path(model, pretrained_model_dir_or_checkpoint)
 
     # dataset
     dataset = ultra_datasets[data_config.get("dataset_name", "t2v_eval")](**data_config.get("dataset_config", {}))

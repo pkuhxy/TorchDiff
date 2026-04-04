@@ -253,8 +253,12 @@ class SkiparseRearrange(nn.Module):
             }[rt]
             if use_skiparse_context_parallel():
                 return parallel_fn(x, grid_sizes, sr)
-            x = self._skiparse_cp_gather(x)
-            return self._skiparse_cp_scatter(plain_fn(x, grid_sizes, sr))
+            return plain_fn(x, grid_sizes, sr)
+        
+        # TODO 1d single⇄group: parallel 快路径未实现，暂时用gather -> rearrange -> scatter代替
+        if rt in (RearrangeType.Skiparse1DSingle2Group, RearrangeType.Skiparse1DGroup2Single):
+            rearrange_func = self._SIMPLE_DISPATCH[rt]
+            return self._skiparse_cp_scatter(rearrange_func(self._skiparse_cp_gather(x), sparse_ratio=sr))
 
         return self._SIMPLE_DISPATCH[rt](x, grid_sizes, sr)
 
@@ -413,10 +417,11 @@ class ContextParallelPreprocessor(MetaPreprocessor):
     # ----------------- preprocess -----------------
 
     def preprocess(self, x, grid_sizes, cp_type=ContextParallelType.CP):
-        if not use_context_parallel() and not use_full_blocks_context_parallel():
-            return x, grid_sizes
-
         cp_group, cp_rank, cp_size = cp_state.get_cp_infos_with_type(cp_type)
+        
+        need_process = (use_context_parallel() or use_full_blocks_context_parallel()) and cp_size > 1
+        if not need_process:
+            return x, grid_sizes
 
         if cp_type is None or cp_type == ContextParallelType.FullBlocksCP:
             # 按照普通cp的方式直接在seq维度切分
@@ -467,11 +472,12 @@ class ContextParallelPreprocessor(MetaPreprocessor):
     # ----------------- postprocess -----------------
 
     def postprocess(self, x, grid_sizes, shard_seq_lens=None, cp_type=ContextParallelType.CP):
-        if not use_context_parallel() and not use_full_blocks_context_parallel():
-            return x
-
         cp_group, cp_rank, cp_size = cp_state.get_cp_infos_with_type(cp_type)
         
+        need_process = (use_context_parallel() or use_full_blocks_context_parallel()) and cp_size > 1
+        if not need_process:
+            return x
+
         if cp_type is None or cp_type == ContextParallelType.FullBlocksCP:
             return all_gather(x, dim=1, group=cp_group)
 
@@ -529,7 +535,10 @@ class ContextParallelPreprocessor(MetaPreprocessor):
         return all_gather(x, dim=1, group=cp_group)
 
     def get_shard_seq_lens(self, shape, grid_sizes, device="cuda", cp_type=ContextParallelType.CP):
-        if not use_context_parallel() and not use_full_blocks_context_parallel():
+        cp_group, cp_rank, cp_size = cp_state.get_cp_infos_with_type(cp_type)
+        
+        need_shard = (use_context_parallel() or use_full_blocks_context_parallel()) and cp_size > 1
+        if not need_shard:
             return [[shape[1]]] * 3
 
         key = (shape, grid_sizes, cp_type)
@@ -680,7 +689,7 @@ class SkiparseRopeWrapper:
             if skiparse_rerrange is not None
             else RearrangeType.Identity
         )
-        key = (T, H, W, rearrange_type, x.device)
+        key = (T, H, W, rearrange_type, cp_type, x.device)
 
         if self.cache.is_exist(key):
             return self.cache.get(key)
@@ -827,13 +836,14 @@ class OSPNextSelfAttention(nn.Module):
 
         if use_context_parallel() or use_full_blocks_context_parallel():
             cp_group, cp_rank, cp_size = cp_state.get_cp_infos_with_type(self.cp_type)
-            if register_q is not None and register_k is not None and register_v is not None:
-                register_q = torch.chunk(register_q, cp_size, dim=2)[cp_rank]
-                register_k = torch.chunk(register_k, cp_size, dim=2)[cp_rank]
-                register_v = torch.chunk(register_v, cp_size, dim=2)[cp_rank]
-            q = all_to_all_4D(q, group=cp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
-            k = all_to_all_4D(k, group=cp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
-            v = all_to_all_4D(v, group=cp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
+            if cp_size > 1:
+                if register_q is not None and register_k is not None and register_v is not None:
+                    register_q = torch.chunk(register_q, cp_size, dim=2)[cp_rank]
+                    register_k = torch.chunk(register_k, cp_size, dim=2)[cp_rank]
+                    register_v = torch.chunk(register_v, cp_size, dim=2)[cp_rank]
+                q = all_to_all_4D(q, group=cp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
+                k = all_to_all_4D(k, group=cp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
+                v = all_to_all_4D(v, group=cp_group, scatter_dim=2, gather_dim=1, shard_seq_lens=shard_seq_lens)
         return q, k, v, register_q, register_k, register_v
 
 
@@ -846,12 +856,13 @@ class OSPNextSelfAttention(nn.Module):
     ):
         if use_context_parallel() or use_full_blocks_context_parallel():
             cp_group, cp_rank, cp_size = cp_state.get_cp_infos_with_type(self.cp_type)
-            if num_register_tokens > 0:
-                register_x, x = x.split_with_sizes([num_register_tokens, x.shape[1] - num_register_tokens], dim=1)
-                register_x = all_gather(register_x, dim=2, group=cp_group)
-            x = all_to_all_4D(x, group=cp_group, scatter_dim=1, gather_dim=2, shard_seq_lens=shard_seq_lens)
-            if num_register_tokens > 0:
-                x = torch.cat([register_x, x], dim=1)
+            if cp_size > 1:
+                if num_register_tokens > 0:
+                    register_x, x = x.split_with_sizes([num_register_tokens, x.shape[1] - num_register_tokens], dim=1)
+                    register_x = all_gather(register_x, dim=2, group=cp_group)
+                x = all_to_all_4D(x, group=cp_group, scatter_dim=1, gather_dim=2, shard_seq_lens=shard_seq_lens)
+                if num_register_tokens > 0:
+                    x = torch.cat([register_x, x], dim=1)
         return x
 
     def forward(
@@ -1264,7 +1275,9 @@ class OSPNextModel(ModelMixin, ConfigMixin):
                 skiparse_block_type = SkiparseBlockType.Single
             else:
                 skiparse_block_type = SkiparseBlockType.Group
+            # 当前block是sparse，上一个block是full (该字段由is_first_sparse_block修改而来)
             is_full2skiparse_block = (i - 1) in full_block_indices and i not in full_block_indices
+            # 当前block是sparse，下一个block是full (该字段由is_last_sparse_block修改而来)
             is_skiparse2full_block = (i + 1) in full_block_indices and i not in full_block_indices
             self.blocks.append(
                 OSPNextAttentionBlock(
@@ -1321,10 +1334,22 @@ class OSPNextModel(ModelMixin, ConfigMixin):
             self.skiparse_model_type != SkiparseModelType.Full and \
             (self.skiparse_1d or self.skiparse_2d) and self.num_full_blocks > 0
 
+        """
+        skiparse cp 的逻辑完全写在了skiparse rearrange中，会根据当前block type自动触发
+        all_to_all, gather, scatter。
+        因此我们只需要关注ulysses cp下该怎么操作序列
+        """
+        # main_cp_type指大部分sparse block采用的self attn处的cp
         if self.skiparse_model_type == SkiparseModelType.Full:
             self.main_cp_type = ContextParallelType.FullBlocksCP
         else:
             self.main_cp_type = ContextParallelType.CP
+
+        # final_cp_type指最后一个block采用的self attn处的cp，用于还原序列
+        if self.blocks[-1].skiparse_block_type == SkiparseBlockType.Full:
+            self.final_cp_type = ContextParallelType.FullBlocksCP
+        else:
+            self.final_cp_type = ContextParallelType.CP
 
         if safe_get_rank() == 0:
             print(f"=" * 20 + f"OSPNextModel init" + "=" * 20)
@@ -1423,18 +1448,22 @@ class OSPNextModel(ModelMixin, ConfigMixin):
             register_tokens = None
 
         # 最终还原postprocess的shard_seq_lens和cp_type
-        final_shard_seq_lens = full_shard_seq_lens
-        final_cp_type = self.main_cp_type
+        if self.final_cp_type == ContextParallelType.CP:
+            final_shard_seq_lens = full_shard_seq_lens
+        elif self.final_cp_type == ContextParallelType.FullBlocksCP:
+            final_shard_seq_lens = full_block_full_shard_seq_lens
         for idx, block in enumerate(self.blocks):
             # 如果是full2skiparse block，且采用了full blocks cp
             # 需要先在full blocks cp group中得到完整序列，再重新在cp group中shard
-            if self.use_full_blocks_context_parallel and block.is_full2skiparse_block:
-                x = self.context_preprocessor.postprocess(
-                    x, grid_sizes, shard_seq_lens=full_block_full_shard_seq_lens, cp_type=ContextParallelType.FullBlocksCP
-                )
-                x, sub_grid_sizes = self.context_preprocessor.preprocess(
-                    x, grid_sizes, cp_type=self.main_cp_type
-                )
+            if self.use_full_blocks_context_parallel:
+                # 不是第一个block，且从full切换到sparse，则重新切分
+                if idx != 0 and block.is_full2skiparse_block:
+                    x = self.context_preprocessor.postprocess(
+                        x, grid_sizes, shard_seq_lens=full_block_full_shard_seq_lens, cp_type=ContextParallelType.FullBlocksCP
+                    )
+                    x, sub_grid_sizes = self.context_preprocessor.preprocess(
+                        x, grid_sizes, cp_type=self.main_cp_type
+                    )
 
             if block.skiparse_block_type == SkiparseBlockType.Full:
                 attn_mask, cross_attn_mask = None, None
@@ -1461,17 +1490,14 @@ class OSPNextModel(ModelMixin, ConfigMixin):
             # 如果是skiparse2full block，且采用了full blocks cp
             # 需要先在cp group中得到完整序列，再重新在full blocks cp group中shard
             if self.use_full_blocks_context_parallel:
-                if block.is_skiparse2full_block:
+                # 不是最后一个block，后续还有full blocks，则重新切分
+                if idx != len(self.blocks) - 1 and block.is_skiparse2full_block:
                     x = self.context_preprocessor.postprocess(
                         x, grid_sizes, shard_seq_lens=full_shard_seq_lens, cp_type=self.main_cp_type
                     )
                     x, sub_grid_sizes = self.context_preprocessor.preprocess(
                         x, grid_sizes, cp_type=ContextParallelType.FullBlocksCP
                     )
-                # 如果最后一个block是full block，且采用了full blocks cp，那么最后应该用full_block_full_shard_seq_lens和cp_type=ContextParallelType.FullBlocksCP来还原序列
-                if idx == len(self.blocks) - 1 and block.skiparse_block_type == SkiparseBlockType.Full:
-                    final_shard_seq_lens = full_block_full_shard_seq_lens
-                    final_cp_type = ContextParallelType.FullBlocksCP
 
         # head
         x = self.head(x, e)
@@ -1480,7 +1506,7 @@ class OSPNextModel(ModelMixin, ConfigMixin):
         x = self.context_preprocessor.postprocess(
             x, grid_sizes, 
             shard_seq_lens=final_shard_seq_lens, 
-            cp_type=final_cp_type
+            cp_type=self.final_cp_type
         )
 
         # unpatchify

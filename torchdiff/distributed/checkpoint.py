@@ -59,9 +59,8 @@ class Checkpointer:
     def last_training_iteration(self):
         return self._last_training_iteration
     
-    @staticmethod
-    def load_state_dict(model: FSDPModule, full_sd: dict, dcp_api: bool = False):
-        if dcp_api:
+    def load_state_dict(self, model: FSDPModule, full_sd: dict):
+        if self.dcp_api:
             set_model_state_dict(
                 model=model,
                 model_state_dict=full_sd,
@@ -83,16 +82,14 @@ class Checkpointer:
                 sharded_meta_param.placements,
             )
             sharded_sd[param_name] = nn.Parameter(sharded_tensor)
-        # choose `assign=True` since we cannot call `copy_` on meta tensor
         missing_keys, unexpected_keys = model.load_state_dict(sharded_sd, strict=False, assign=True)
         if torch.distributed.get_rank() == 0:
             print("missing_keys", missing_keys)
             print("unexpected_keys", unexpected_keys)
         del full_sd, sharded_sd
         gc.collect()
-    
-    @staticmethod
-    def load_model_from_path(model: FSDPModule, model_path: str, dcp_api: bool = False):
+
+    def load_model_from_path(self, model: FSDPModule, model_path: str):
         print(f'load model from {model_path}')
         if not model_path.endswith(".safetensors"):
             full_sd = torch.load(
@@ -100,7 +97,7 @@ class Checkpointer:
             )
         else:
             full_sd = safe_load(model_path, device="cpu")
-        Checkpointer.load_state_dict(model, full_sd, dcp_api=dcp_api)
+        self.load_state_dict(model, full_sd)
         del full_sd
 
     def load_model(self, model: FSDPModule, ema: bool = False):
@@ -113,7 +110,7 @@ class Checkpointer:
             full_sd = torch.load(
                 last_model_checkpoint, mmap=True, weights_only=True, map_location="cpu"
             )
-            self.load_state_dict(model, full_sd, dcp_api=self.dcp_api)
+            self.load_state_dict(model, full_sd)
             del full_sd
         else:
             print(f'warning! nothing find in {last_model_checkpoint}')
