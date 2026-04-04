@@ -104,6 +104,7 @@ def sde_step_with_logprob(
     generator=None,
     determistic=False,
     return_dt_and_std_dev_t=False,
+    cp_group=None,
 ):
     """
     Flow matching SDE step with log probability computation.
@@ -142,6 +143,9 @@ def sde_step_with_logprob(
                 device=model_output.device,
                 dtype=model_output.dtype,
             )
+            # 同步SDE噪声到CP组内
+            if cp_group is not None:
+                torch.distributed.broadcast(variance_noise, group_src=0, group=cp_group)
             prev_sample = prev_sample_mean + std_dev_t * torch.sqrt(-1 * dt_b) * variance_noise
         else:
             # 最后一步（t=0）不加噪，直接使用预测均值，避免残留无法去除的随机噪声
@@ -209,7 +213,7 @@ def osp_sample_with_logprob(
 
     # CP 组内同步初始噪声
     if cp_group is not None:
-        torch.distributed.broadcast(latents, src=dist.get_global_rank(cp_group, 0), group=cp_group)
+        torch.distributed.broadcast(latents, group_src=0, group=cp_group)
 
     # Set up sigma schedule
     sigmas = torch.linspace(1.0, 0.0, num_inference_steps + 1, device=device)
@@ -265,6 +269,7 @@ def osp_sample_with_logprob(
                 latents.float(),
                 num_inference_steps,
                 determistic=False,
+                cp_group=cp_group,
             )
         else:
             # ODE 步：确定性去噪，不添加噪声
@@ -275,6 +280,7 @@ def osp_sample_with_logprob(
                 latents.float(),
                 num_inference_steps,
                 determistic=True,
+                cp_group=cp_group,
             )
         del noise_pred, latents_input
 
@@ -313,6 +319,7 @@ def osp_sample_with_logprob(
                 latents_ori.float(),
                 num_inference_steps,
                 prev_sample=latents.float(),
+                cp_group=cp_group,
             )
             del ref_noise_pred
             kl = ((prev_latents_mean - ref_prev_latents_mean) ** 2 / (2 * std_dev_t ** 2))
@@ -415,6 +422,7 @@ def osp_sample_deterministic(
             latents.float(),
             num_inference_steps,
             determistic=True,
+            cp_group=None,
         )
         del noise_pred, latents_input
 
@@ -488,6 +496,7 @@ def compute_log_prob_for_training(
         num_inference_steps,
         prev_sample=sample["next_latents"][:, step_idx].float(),
         return_dt_and_std_dev_t=True,
+        cp_group=None,  # 训练阶段直接给定 prev_sample 不生成噪声，不需传 cp_group
     )
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t, dt
@@ -626,28 +635,41 @@ def save_lora_checkpoint(model, save_dir, global_step):
     the underlying tensor storage may become invalid, causing
     'RuntimeError: Attempted to access the data pointer on an invalid python storage.'
     """
+    from torch.distributed.tensor import DTensor
+    
     save_root = os.path.join(save_dir, f"lora-checkpoint-{global_step}")
-    os.makedirs(save_root, exist_ok=True)
+    if dist.get_rank() == 0:
+        os.makedirs(save_root, exist_ok=True)
+    dist.barrier()
+    
     # Manually extract LoRA parameters (keys containing 'lora_')
     lora_state_dict = {}
     for name, param in model.named_parameters():
         if 'lora_' in name:
-            # Clone and move to CPU to avoid invalid storage issues
-            lora_state_dict[name] = param.detach().clone().cpu()
+            # Handle FSDP DTensor: full_tensor() requires all ranks to participate
+            if isinstance(param, DTensor):
+                full_param = param.full_tensor()
+            else:
+                full_param = param
+                
+            if dist.get_rank() == 0:
+                # Clone and move to CPU to avoid invalid storage issues
+                lora_state_dict[name] = full_param.detach().clone().cpu()
     
-    if lora_state_dict:
+    if dist.get_rank() == 0 and lora_state_dict:
         torch.save(lora_state_dict, os.path.join(save_root, "adapter_model.bin"))
-    
-    # Also save the adapter config if available
-    if hasattr(model, 'peft_config'):
-        import json
-        for adapter_name, peft_cfg in model.peft_config.items():
-            config_dict = peft_cfg.to_dict() if hasattr(peft_cfg, 'to_dict') else vars(peft_cfg)
-            with open(os.path.join(save_root, "adapter_config.json"), "w") as f:
-                json.dump(config_dict, f, indent=2, default=str)
-            break  # Save config for the first (default) adapter
-    
-    print(f"[Rank {dist.get_rank()}] LoRA checkpoint saved to {save_root} ({len(lora_state_dict)} parameters)")
+        
+        # Also save the adapter config if available
+        if hasattr(model, 'peft_config'):
+            import json
+            for adapter_name, peft_cfg in model.peft_config.items():
+                config_dict = peft_cfg.to_dict() if hasattr(peft_cfg, 'to_dict') else vars(peft_cfg)
+                with open(os.path.join(save_root, "adapter_config.json"), "w") as f:
+                    json.dump(config_dict, f, indent=2, default=str)
+                break  # Save config for the first (default) adapter
+        
+        print(f"[Rank 0] LoRA checkpoint saved to {save_root} ({len(lora_state_dict)} parameters)")
+
 
 
 # ==================== Main Training ====================
@@ -730,8 +752,10 @@ def main(config):
     weight_dtype = config.get("weight_dtype", "bfloat16")
     reshard_after_forward = config.get("reshard_after_forward", None)
     model_cpu_offload = config.get("model_cpu_offload", False)
+    encoder_cpu_offload = config.get("encoder_cpu_offload", False)
     use_context_parallel = config.get("use_context_parallel", False)
     use_skiparse_context_parallel = config.get("use_skiparse_context_parallel", False)
+    deterministic_training = config.get("deterministic_training", False)
 
     # save config
     output_dir = config.get("output_dir", "./output_rl_lora")
@@ -763,6 +787,8 @@ def main(config):
     if fsdp_size > world_size:
         fsdp_size = world_size
         log_on_main_process(logger, f"Warning: GPU nums not enough! FSDP size reset to {fsdp_size}!")
+    elif world_size % fsdp_size != 0:
+        raise ValueError(f"world_size % fsdp_size != 0, fsdp error!")
     ddp_size = config.get("ddp_size", world_size // fsdp_size)
     ddp_fsdp_mesh = init_device_mesh("cuda", (ddp_size, fsdp_size), mesh_dim_names=("ddp", "fsdp"))
     logger.info(f"rank {rank} use ddp mesh {ddp_fsdp_mesh['ddp']} and fsdp mesh {ddp_fsdp_mesh['fsdp']}")
@@ -812,15 +838,29 @@ def main(config):
     log_on_main_process(logger, f"VAE model initialized, memory: {get_memory_allocated()} GiB")
 
     log_on_main_process(logger, "Initializing text encoder model...")
+    text_encoder_device_mesh = None
+    if text_encoder_config.get("use_fsdp", False):
+        num_replicate = max(world_size // 8, 1)
+        num_shard = world_size // num_replicate
+        text_encoder_device_mesh = init_device_mesh("cuda", (num_replicate, num_shard), mesh_dim_names=("replicate", "shard"))
     text_encoder = T5EncoderModel(
         text_len=text_encoder_config.get("text_len", 512),
         dtype=text_encoder_config.get("dtype", weight_dtype),
         device=device,
         checkpoint_path=text_encoder_config.get("checkpoint_path", None),
         use_fsdp=text_encoder_config.get("use_fsdp", False),
-        device_mesh=ddp_fsdp_mesh if text_encoder_config.get("use_fsdp", False) else None,
+        device_mesh=text_encoder_device_mesh,
     )
     log_on_main_process(logger, f"Text encoder initialized, memory: {get_memory_allocated()} GiB")
+
+    text_encoder_use_fsdp = text_encoder_config.get("use_fsdp", False)
+    if encoder_cpu_offload:
+        log_on_main_process(logger, "Offloading VAE and text encoder to CPU to save GPU memory...")
+        vae.model.to("cpu")
+        if not text_encoder_use_fsdp:
+            text_encoder.model.to("cpu")
+        torch.cuda.empty_cache()
+        log_on_main_process(logger, f"After encoder CPU offload, memory allocated: {get_memory_allocated()} GiB")
 
     log_on_main_process(logger, "Initializing scheduler...")
     scheduler = schedulers[scheduler_config.get("scheduler_name", "flow_matching")](**scheduler_config)
@@ -929,7 +969,8 @@ def main(config):
     sys.stdout.flush(); sys.stderr.flush()
 
     if not has_loaded_pretrained_model:
-        model.to_empty(device=device)
+        init_device = "cpu" if model_cpu_offload else device
+        model.to_empty(device=init_device)
         set_seed(seed, device_specific=False)
         base_model.reset_parameters()
 
@@ -1001,7 +1042,7 @@ def main(config):
 
     first_epoch = 0 if checkpointer.last_training_iteration is None else checkpointer.last_training_iteration
 
-    set_seed(seed, device_specific=True, process_group=dp_group)
+    set_seed(seed, device_specific=True, process_group=dp_group, deterministic=deterministic_training)
 
     # ========== RL Dataset & Reward ====================
     log_on_main_process(logger, f"Initializing reward functions with config: {reward_fn_config}")
@@ -1307,8 +1348,8 @@ def main(config):
                 checkpointer.save_ema_model(model, epoch)
                 ema_model.restore(model)
                 adaptive_grad_clipper.save(output_dir=f"{output_dir}/{checkpoint_prefix}{epoch:09d}")
-                # Also save LoRA-specific checkpoint (rank 0 only)
-                if rank == 0 and hasattr(model, 'save_pretrained'):
+                # Also save LoRA-specific checkpoint
+                if hasattr(model, 'save_pretrained'):
                     save_lora_checkpoint(model, output_dir, epoch)
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
@@ -1584,7 +1625,12 @@ def main(config):
             # log_probs 会逐渐产生差异，使 ratio 偏离 1.0，PPO clip 机制生效。
 
             # Shuffle along batch dimension (samples are on CPU)
-            perm = torch.randperm(total_batch_size_local)
+            perm = torch.randperm(total_batch_size_local, device=device)
+            # 同步 perm 索引：只要同一 CP 组内的卡取数据的顺序完全一致，就能保证整个 micro_batch 的输入一致，避免了广播巨大的 latents 导致通信阻塞
+            if use_global_context_parallel:
+                torch.distributed.broadcast(perm, group_src=0, group=global_cp_group)
+            perm = perm.cpu()
+            
             samples = {
                 k: (
                     {sub_k: sub_v[perm] for sub_k, sub_v in v.items()}
@@ -1771,8 +1817,8 @@ def main(config):
             checkpointer.save_ema_model(model, global_step)
             ema_model.restore(model)
             adaptive_grad_clipper.save(output_dir=f"{output_dir}/{checkpoint_prefix}{global_step:09d}")
-            # Also save LoRA-specific checkpoint (rank 0 only)
-            if rank == 0 and hasattr(model, 'save_pretrained'):
+            # Also save LoRA-specific checkpoint
+            if hasattr(model, 'save_pretrained'):
                 save_lora_checkpoint(model, output_dir, global_step)
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
@@ -1921,8 +1967,8 @@ def main(config):
     checkpointer.save_ema_model(model, global_step)
     ema_model.restore(model)
     adaptive_grad_clipper.save(output_dir=f"{output_dir}/{checkpoint_prefix}{global_step:09d}")
-    # Also save LoRA-specific checkpoint (rank 0 only)
-    if rank == 0 and hasattr(model, 'save_pretrained'):
+    # Also save LoRA-specific checkpoint
+    if hasattr(model, 'save_pretrained'):
         save_lora_checkpoint(model, output_dir, global_step)
 
     log_on_main_process(logger, f"""
