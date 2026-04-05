@@ -245,23 +245,29 @@ class Checkpointer:
             return {}
 
     def load_dataloader_state_dict(self, dataloader):
+        if dataloader is None:
+            return
         assert isinstance(dataloader, StatefulDataLoader), "only StatefulDataLoader has state."
         last_dataloader_checkpoint_dir = (
             f"{self.save_root_dir}/{PREFIX}{self.last_training_iteration:09d}/{DATALOADER_CHECKPOINT_DIR}"
         )
-        if os.path.exists(last_dataloader_checkpoint_dir):
+        rank_file = f"{last_dataloader_checkpoint_dir}/rank_{torch.distributed.get_rank():06d}.pkl"
+        if os.path.exists(last_dataloader_checkpoint_dir) and os.path.exists(rank_file):
             print(f'resume dataloader_state_dict from {last_dataloader_checkpoint_dir}')
             if is_npu_available(): # npu will raise serialization error if we use 'load' func from accelerate
-                dataloader_state_dict = torch.load(f"{last_dataloader_checkpoint_dir}/rank_{torch.distributed.get_rank():06d}.pkl", weights_only=False, map_location="cpu")
+                dataloader_state_dict = torch.load(rank_file, weights_only=False, map_location="cpu")
             else:
-                dataloader_state_dict = load(f"{last_dataloader_checkpoint_dir}/rank_{torch.distributed.get_rank():06d}.pkl", map_location="cpu")
-            dataloader.load_state_dict(dataloader_state_dict)
+                dataloader_state_dict = load(rank_file, map_location="cpu")
+            if dataloader_state_dict is not None:
+                dataloader.load_state_dict(dataloader_state_dict)
             del dataloader_state_dict
             gc.collect()
         else:
             print(f'warning! nothing find in {last_dataloader_checkpoint_dir}')
     
     def _get_full_dataloader_state_dict(self, dataloader):
+        if dataloader is None:
+            return None
         assert isinstance(dataloader, StatefulDataLoader), "only StatefulDataLoader has state."
         return dataloader.state_dict()
         
@@ -314,7 +320,8 @@ class Checkpointer:
         dataloader_checkpoint_dir = f"{new_checkpoint_folder}/{DATALOADER_CHECKPOINT_DIR}"
         if torch.distributed.get_rank() == 0:
             os.makedirs(rng_checkpoint_dir, exist_ok=True)
-            os.makedirs(dataloader_checkpoint_dir, exist_ok=True)
+            if dataloader_state_dict is not None:
+                os.makedirs(dataloader_checkpoint_dir, exist_ok=True)
             new_model_checkpoint = f"{new_checkpoint_folder}/{MODEL_CHECKPOINT}"
             new_optim_checkpoint = f"{new_checkpoint_folder}/{OPTIM_CHECKPOINT}"
             os.makedirs(new_checkpoint_folder, exist_ok=True)
@@ -322,11 +329,13 @@ class Checkpointer:
             torch.save(optim_state_dict, new_optim_checkpoint)
         torch.distributed.barrier()
         torch.save(rng_state_dict, f"{rng_checkpoint_dir}/rank_{torch.distributed.get_rank():06d}.pkl")
-        torch.save(dataloader_state_dict, f"{dataloader_checkpoint_dir}/rank_{torch.distributed.get_rank():06d}.pkl")
+        if dataloader_state_dict is not None:
+            torch.save(dataloader_state_dict, f"{dataloader_checkpoint_dir}/rank_{torch.distributed.get_rank():06d}.pkl")
         del model_state_dict
         del optim_state_dict
         del rng_state_dict
-        del dataloader_state_dict
+        if dataloader_state_dict is not None:
+            del dataloader_state_dict
 
     def save_ema_model(self, ema_model: FSDPModule, iteration: int):
         model_state_dict = self._get_full_model_state_dict(ema_model)
