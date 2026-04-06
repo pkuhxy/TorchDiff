@@ -950,6 +950,11 @@ def main(config):
     base_model = model.get_base_model() if hasattr(model, 'get_base_model') else model
     model.train()
 
+    if model_cpu_offload:
+        log_on_main_process(logger, "Moving model to CPU for FSDP CPU offloading to prevent NPU OOM...")
+        model.to("cpu")
+        torch.cuda.empty_cache()
+
     # Step 3: FSDP2 wrap (wraps the entire PeftModel including LoRA params)
     # All params are requires_grad=True at this point so FSDP2 FlatParameters
     # maintain gradient tracking through the forward pass.
@@ -1334,10 +1339,21 @@ def main(config):
             prompt_metadata = batch["metadata"]
             all_prompts.extend(prompts)
 
+            if encoder_cpu_offload:
+                vae.model.to(device)
+                if not text_encoder_use_fsdp:
+                    text_encoder.model.to(device)
+
             # Encode prompts
             with torch.no_grad():
                 text_embeddings = text_encoder(prompt_ids, prompt_mask)
             torch.cuda.synchronize()
+
+            if encoder_cpu_offload:
+                vae.model.to("cpu")
+                if not text_encoder_use_fsdp:
+                    text_encoder.model.to("cpu")
+                torch.cuda.empty_cache()
 
             # Save/eval checkpoint
             if batch_idx == 0 and epoch % save_interval == 0 and epoch > 0:
@@ -1863,9 +1879,20 @@ def main(config):
                 eval_prompt_ids = eval_batch[PROMPT_IDS].to(device)
                 eval_prompt_mask = eval_batch[PROMPT_MASK].to(device)
 
+                if encoder_cpu_offload:
+                    vae.model.to(device)
+                    if not text_encoder_use_fsdp:
+                        text_encoder.model.to(device)
+
                 with torch.no_grad():
                     eval_text_embeddings = text_encoder(eval_prompt_ids, eval_prompt_mask)
                 torch.cuda.synchronize()
+
+                if encoder_cpu_offload:
+                    vae.model.to("cpu")
+                    if not text_encoder_use_fsdp:
+                        text_encoder.model.to("cpu")
+                    torch.cuda.empty_cache()
 
                 eval_latent_shape = (len(eval_prompt_texts), latent_C, latent_T, latent_H, latent_W)
 
