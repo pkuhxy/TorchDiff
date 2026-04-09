@@ -74,8 +74,12 @@ class Checkpointer:
             return
         meta_sharded_sd = model.state_dict()
         sharded_sd = {}
+        unexpected_keys_found = []
         for param_name, full_tensor in full_sd.items():
             sharded_meta_param = meta_sharded_sd.get(param_name)
+            if sharded_meta_param is None:
+                unexpected_keys_found.append(param_name)
+                continue
             sharded_tensor = distribute_tensor(
                 full_tensor,
                 sharded_meta_param.device_mesh,
@@ -85,7 +89,7 @@ class Checkpointer:
         missing_keys, unexpected_keys = model.load_state_dict(sharded_sd, strict=False, assign=True)
         if torch.distributed.get_rank() == 0:
             print("missing_keys", missing_keys)
-            print("unexpected_keys", unexpected_keys)
+            print("unexpected_keys", unexpected_keys_found + unexpected_keys)
         del full_sd, sharded_sd
         gc.collect()
 

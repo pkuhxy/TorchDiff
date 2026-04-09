@@ -35,6 +35,68 @@ from torchdiff.pipelines import pipelines
 from torchdiff.utils.infer_utils import load_prompts, load_images, save_videos, save_video_grid
 from torchdiff.utils.random_utils import set_seed
 
+def load_lora_and_merge(
+    model,
+    lora_path,
+    lora_rank=32,
+    lora_alpha=64,
+    lora_target_modules=None,
+    logger=None,
+    rank=0,
+):
+    """
+    Load LoRA weights from a manually saved adapter_model.bin, then merge into base model.
+    """
+    from peft import LoraConfig, get_peft_model
+    if lora_target_modules is None:
+        lora_target_modules = [
+            "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
+            "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
+        ]
+
+    if not os.path.isfile(lora_path):
+        raise ValueError(f"LoRA file not found: {lora_path}")
+
+    if logger is not None:
+        from torchdiff.utils.log_utils import log_on_main_process
+        log_on_main_process(logger, f"Loading LoRA from {lora_path}")
+        log_on_main_process(logger, f"LoRA rank={lora_rank}, alpha={lora_alpha}")
+        log_on_main_process(logger, f"LoRA target_modules={lora_target_modules}")
+
+    peft_config = LoraConfig(
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        init_lora_weights="gaussian",
+        target_modules=lora_target_modules,
+    )
+
+    model = get_peft_model(model, peft_config)
+    model.set_adapter("default")
+
+    lora_sd = torch.load(lora_path, map_location="cpu")
+    missing, unexpected = model.load_state_dict(lora_sd, strict=False)
+
+    if rank == 0:
+        print(f"[LoRA] missing keys: {len(missing)}")
+        print(f"[LoRA] unexpected keys: {len(unexpected)}")
+
+    # sanity check
+    missing_lora = [k for k in missing if "lora_" in k]
+    if len(unexpected) > 0:
+        raise RuntimeError(f"LoRA load has unexpected keys, example: {unexpected[:20]}")
+    if len(missing_lora) > 0:
+        raise RuntimeError(f"LoRA load missing LoRA keys, example: {missing_lora[:20]}")
+
+    if logger is not None:
+        log_on_main_process(logger, "LoRA weights loaded successfully, merging into base model...")
+
+    model = model.merge_and_unload()
+
+    if logger is not None:
+        log_on_main_process(logger, "LoRA merged into base model successfully.")
+
+    return model
+
 def main(config):
     logger = get_logger()
 
@@ -67,6 +129,18 @@ def main(config):
     reshard_after_forward = config.get("reshard_after_forward", None)
     model_cpu_offload = config.get("model_cpu_offload", False)
     explicit_prefetching_num_blocks = config.get("explicit_prefetching_num_blocks", 0)
+
+    # LoRA config
+    lora_path = config.get("lora_path", None)
+    lora_rank = config.get("lora_rank", 32)
+    lora_alpha = config.get("lora_alpha", 64)
+    lora_target_modules = config.get(
+        "lora_target_modules",
+        [
+            "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
+            "cross_attn.q", "cross_attn.k", "cross_attn.v", "cross_attn.o",
+        ]
+    )
 
     # save config
     output_dir = config.get("output_dir", "./output")
@@ -185,6 +259,28 @@ def main(config):
     
     model.eval()
 
+    # if model was initialized on meta, materialize and load base checkpoint first
+    if not has_loaded_pretrained_model:
+        model.to_empty(device=device)
+        set_seed(seed, device_specific=False) # for init
+        model.reset_parameters() # we should call reset_parameters because we init model at meta device 
+
+    if pretrained_model_dir_or_checkpoint is not None and os.path.isfile(pretrained_model_dir_or_checkpoint):
+        log_on_main_process(logger, f"Load model from pretrained_model_checkpoint {pretrained_model_dir_or_checkpoint}")
+        Checkpointer(folder=output_dir, dcp_api=save_with_dcp_api).load_model_from_path(model, pretrained_model_dir_or_checkpoint)
+        has_loaded_pretrained_model = True
+
+    if lora_path is not None:
+        model = load_lora_and_merge(
+            model=model,
+            lora_path=lora_path,
+            lora_rank=lora_rank,
+            lora_alpha=lora_alpha,
+            lora_target_modules=lora_target_modules,
+            logger=logger,
+            rank=rank,
+        )
+
     # wrap model with fsdp2 mix-precision wrapper
     FSDP2_mix_wrapper(
         model,
@@ -200,16 +296,7 @@ def main(config):
     if explicit_prefetching_num_blocks > 0:
         set_modules_to_forward_prefetch(model.blocks, num_to_forward_prefetch=explicit_prefetching_num_blocks)
 
-    if not has_loaded_pretrained_model:
-        model.to_empty(device=device)
-        set_seed(seed, device_specific=False) # for init
-        model.reset_parameters() # we should call reset_parameters because we init model at meta device 
-
     log_on_main_process(logger, f"Diffusion model initialized, memory allocated: {get_memory_allocated()} GiB")
-
-    if pretrained_model_dir_or_checkpoint is not None and os.path.isfile(pretrained_model_dir_or_checkpoint):
-        log_on_main_process(logger, f"Load model from pretrained_model_checkpoint {pretrained_model_dir_or_checkpoint}")
-        Checkpointer(folder=output_dir, dcp_api=save_with_dcp_api).load_model_from_path(model, pretrained_model_dir_or_checkpoint)
 
     pipeline = pipelines[pipeline_name](
         vae=vae,
