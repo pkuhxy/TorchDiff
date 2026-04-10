@@ -267,7 +267,20 @@ def main(config):
 
     if pretrained_model_dir_or_checkpoint is not None and os.path.isfile(pretrained_model_dir_or_checkpoint):
         log_on_main_process(logger, f"Load model from pretrained_model_checkpoint {pretrained_model_dir_or_checkpoint}")
-        Checkpointer(folder=output_dir, dcp_api=save_with_dcp_api).load_model_from_path(model, pretrained_model_dir_or_checkpoint)
+        if pretrained_model_dir_or_checkpoint.endswith(".safetensors"):
+            from safetensors.torch import load_file as safe_load
+            full_sd = safe_load(pretrained_model_dir_or_checkpoint, device="cpu")
+        else:
+            full_sd = torch.load(pretrained_model_dir_or_checkpoint, mmap=True, weights_only=True, map_location="cpu")
+        
+        # Load directly into the un-wrapped model, matching the behavior in train_osp_RL_lora.py
+        missing_keys, unexpected_keys = model.load_state_dict(full_sd, strict=False)
+        if rank == 0:
+            if missing_keys:
+                print(f"[Base model checkpoint] missing_keys: {missing_keys[:20]}...")
+            if unexpected_keys:
+                print(f"[Base model checkpoint] unexpected_keys: {unexpected_keys[:20]}...")
+        del full_sd
         has_loaded_pretrained_model = True
 
     if lora_path is not None:
