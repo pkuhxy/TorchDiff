@@ -77,7 +77,10 @@ def load_lora_and_merge(
     missing, unexpected = model.load_state_dict(lora_sd, strict=False)
 
     if rank == 0:
-        print(f"[LoRA] missing keys: {len(missing)}")
+        # 只打印缺失的 lora_ 键，基础模型的键缺失是正常的，因为 lora 权重里本来就只有 lora_ 相关的键
+        missing_lora = [k for k in missing if "lora_" in k]
+        if missing_lora:
+            print(f"[LoRA] missing lora keys: {len(missing_lora)}, example: {missing_lora[:5]}")
         print(f"[LoRA] unexpected keys: {len(unexpected)}")
 
     # sanity check

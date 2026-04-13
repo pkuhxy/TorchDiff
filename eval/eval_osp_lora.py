@@ -53,11 +53,8 @@ def load_lora_and_merge(
 ):
     """
     Load LoRA weights from a manually saved adapter_model.bin, then merge into base model.
-
-    Expected LoRA key style:
-        base_model.model.blocks.0.self_attn.q.lora_A.default.weight
-        ...
     """
+    from peft import LoraConfig, get_peft_model
     if lora_target_modules is None:
         lora_target_modules = [
             "self_attn.q", "self_attn.k", "self_attn.v", "self_attn.o",
@@ -68,6 +65,7 @@ def load_lora_and_merge(
         raise ValueError(f"LoRA file not found: {lora_path}")
 
     if logger is not None:
+        from torchdiff.utils.log_utils import log_on_main_process
         log_on_main_process(logger, f"Loading LoRA from {lora_path}")
         log_on_main_process(logger, f"LoRA rank={lora_rank}, alpha={lora_alpha}")
         log_on_main_process(logger, f"LoRA target_modules={lora_target_modules}")
@@ -86,21 +84,18 @@ def load_lora_and_merge(
     missing, unexpected = model.load_state_dict(lora_sd, strict=False)
 
     if rank == 0:
-        print(f"[LoRA] missing keys: {len(missing)}")
+        # 只打印缺失的 lora_ 键，基础模型的键缺失是正常的，因为 lora 权重里本来就只有 lora_ 相关的键
+        missing_lora = [k for k in missing if "lora_" in k]
+        if missing_lora:
+            print(f"[LoRA] missing lora keys: {len(missing_lora)}, example: {missing_lora[:5]}")
         print(f"[LoRA] unexpected keys: {len(unexpected)}")
-        print(f"[LoRA] missing sample: {missing[:20]}")
-        print(f"[LoRA] unexpected sample: {unexpected[:20]}")
 
     # sanity check
     missing_lora = [k for k in missing if "lora_" in k]
     if len(unexpected) > 0:
-        raise RuntimeError(
-            f"LoRA load has unexpected keys, example: {unexpected[:20]}"
-        )
+        raise RuntimeError(f"LoRA load has unexpected keys, example: {unexpected[:20]}")
     if len(missing_lora) > 0:
-        raise RuntimeError(
-            f"LoRA load missing LoRA keys, example: {missing_lora[:20]}"
-        )
+        raise RuntimeError(f"LoRA load missing LoRA keys, example: {missing_lora[:20]}")
 
     if logger is not None:
         log_on_main_process(logger, "LoRA weights loaded successfully, merging into base model...")
