@@ -1796,9 +1796,9 @@ def main(config):
                                         print(f"[DEBUG grad] {_dn}: grad is None!")
                                     break
                         # --- END DEBUG ---
-                        grad_norm = adaptive_grad_clipper.adaptive_clip(model.parameters())
+                        grad_norm = adaptive_grad_clipper.adaptive_clip(trainable_parameters)
                         optimizer.step()
-                        optimizer.zero_grad()
+                        model.zero_grad(set_to_none=True)
                         # --- DEBUG: check LoRA param after optimizer step ---
                         if rank == 0 and global_step < 3:
                             for _dn, _dp in model.named_parameters():
@@ -1838,9 +1838,9 @@ def main(config):
 
             # Handle remaining gradients
             if backward_counter % accum_steps_total != 0:
-                grad_norm = adaptive_grad_clipper.adaptive_clip(model.parameters())
+                grad_norm = adaptive_grad_clipper.adaptive_clip(trainable_parameters)
                 optimizer.step()
-                optimizer.zero_grad()
+                model.zero_grad(set_to_none=True)
                 ema_model.update(model, global_step + 1)
                 global_step += 1
                 backward_counter = 0
