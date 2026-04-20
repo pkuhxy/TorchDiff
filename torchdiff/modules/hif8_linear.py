@@ -28,7 +28,7 @@ import torch.nn.functional as F
 # NPU operator import (placeholder until the actual op package is available)
 # ---------------------------------------------------------------------------
 try:
-    from quant_cy_npu import QType, quant_dequant_float  # 这里需要编译那个quant_cy_npu算子之后才能import;  编译方法： 解压后， 直接  bash build.sh
+    from torchdiff.quant_cy_npu import QType, quant_dequant_float  # 这里需要编译那个quant_cy_npu算子之后才能import;  编译方法： 解压后， 直接  bash build.sh
 except ImportError:
     # Temporary stub so the code can be imported without the real op.
     # Replace with the real import once hif8_ops is installed.
