@@ -16,7 +16,7 @@ export HCCL_EXEC_TIMEOUT=0
 export ACL_DEVICE_SYNC_TIMEOUT=3600
 
 # 每个节点的卡数
-NPROC_PER_NODE=${MA_NUM_GPUS:-8}
+NPROC_PER_NODE=${MA_NUM_GPUS:-16}
 
 # 节点总数
 NNODES=${MA_NUM_HOSTS:-1}
@@ -47,5 +47,5 @@ torchrun \
   --node_rank=${NODE_RANK} \
   --master_addr=${MASTER_ADDR} \
   --master_port=${MASTER_PORT} \
-  eval/eval_osp.py \
+  eval/eval_osp_lora.py \
   --config configs/eval/npu/osp_1_3b.yaml

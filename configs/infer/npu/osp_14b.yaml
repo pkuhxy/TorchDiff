@@ -4,8 +4,12 @@ model_name: "osp_next"
 pipeline_name: "t2v"
 seed: 1024
 
-prompt_txt: "assets/t2v/MovieGenVideoBench_rewritten.txt"
-output_dir: "samples/osp_next_14b_81f720p_sparse2d2_ssp4/iter_000006000_ema"
+
+prompt_txt: "assets/t2v/eval_Moviegen.txt"
+# prompt_txt: "assets/t2v/eval_vbench.txt"
+# output_dir: "samples/osp_next_mixgrpo/vbench_eval/lr805/step100"
+output_dir: "samples/osp_next_mixgrpo/moviegen/lr805/baseline"
+
 
 num_frames: 81
 height: 720
@@ -16,12 +20,13 @@ batch_size: 1
 fsdp_size: 8
 cp_size: 2
 skiparse_cp_size: 4
-use_context_parallel: False
+use_context_parallel: True
 use_skiparse_context_parallel: True
+
+reshard_after_forward: True
+
 reshard_after_forward: Null
-explicit_prefetching_num_blocks: 0
-weight_dtype: "bf16"
-save_with_dcp_api: False
+
 
 model_config:
   dim: 5120
@@ -38,7 +43,9 @@ model_config:
   num_register_tokens: 0
   skiparse_1d: False
   skiparse_2d: True
-  pretrained_model_dir_or_checkpoint: "output/osp_next_14b_81f720p_sparse2d2_ssp4/iter_000006000/ema_model_state_dict.pt"
+
+  pretrained_model_dir_or_checkpoint: "/home/ma-user/work/gyy/TorchDiff/output/osp_next_14b_81f720p_sparse2d2_ssp4/iter_000006000/ema_model_state_dict.pt"
+
 
 scheduler_config:
   scheduler_name: "flow_matching"
@@ -47,11 +54,11 @@ scheduler_config:
   guidance_scale: 5.0
 
 vae_config:
-  vae_path: "Wan2.1-T2V-14B/Wan2.1_VAE.pth"
+  vae_path: "/home/ma-user/work/gyy/TorchDiff/Wan2.1-T2V-14B/Wan2.1_VAE.pth"
   dtype: "fp16"
 
 text_encoder_config:
   text_len: 512
-  checkpoint_path: "Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth"
-  text_tokenizer_path: "Wan2.1-T2V-14B/google/umt5-xxl"
+  checkpoint_path: "/home/ma-user/work/gyy/TorchDiff/Wan2.1-T2V-14B/models_t5_umt5-xxl-enc-bf16.pth"
+  text_tokenizer_path: "/home/ma-user/work/gyy/TorchDiff/Wan2.1-T2V-14B/google/umt5-xxl"
   use_fsdp: True
