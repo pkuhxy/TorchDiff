@@ -1,32 +1,12 @@
-"""
-VideoAlign Reward Scorer
-
-Wraps the VideoAlign model (VideoVLMRewardInference) to work with the
-TorchDiff reward interface. VideoAlign provides three evaluation dimensions:
-  - VQ (Visual Quality)
-  - MQ (Motion Quality)
-  - TA (Text Alignment)
-  - Overall = VQ + MQ + TA
-
-Since VideoAlign expects video file paths as input, this scorer converts
-numpy/tensor video frames into temporary mp4 files before scoring.
-
-All VideoAlign dependencies are now local within torchdiff/rewards/,
-no sys.path manipulation is needed.
-
-Input:  numpy array of shape (B, F, H, W, C) uint8 [0,255] + prompts
-Output: list of float rewards (Overall score, normalized)
-"""
-
 import os
 import tempfile
 import shutil
 import numpy as np
 import torch
-import torch_npu
+import json
+import argparse
 from typing import List, Union, Optional
 from PIL import Image
-
 
 class VideoAlignScorer:
     def __init__(
@@ -42,20 +22,6 @@ class VideoAlignScorer:
         max_pixels: Optional[int] = None,
         save_fps: int = 8,  # fps for writing temp video files
     ):
-        """
-        VideoAlign reward scorer.
-
-        :param device: Device to run the model on
-        :param dtype: Data type for the model
-        :param load_from_pretrained: Path to VideoAlign checkpoint directory
-        :param load_from_pretrained_step: Checkpoint step to load (-1 for latest)
-        :param reward_dim: Which dimension to use as reward ("VQ", "MQ", "TA", "Overall")
-        :param use_norm: Whether to normalize the reward scores
-        :param fps: FPS for VideoAlign video sampling (None to use model default)
-        :param num_frames: Number of frames for VideoAlign sampling (None to use model default)
-        :param max_pixels: Max pixels for VideoAlign (None to use model default)
-        :param save_fps: FPS used when saving temp video files from numpy arrays
-        """
         self.device = device
         self.reward_dim = reward_dim
         self.use_norm = use_norm
@@ -78,41 +44,22 @@ class VideoAlignScorer:
         print(f"[VideoAlignScorer] reward_dim={reward_dim}, use_norm={use_norm}")
 
     def _save_video_to_tempfile(self, frames: np.ndarray, tmp_dir: str, idx: int) -> str:
-        """
-        Save numpy video frames to a temporary mp4 file.
-
-        :param frames: (F, H, W, C) uint8 numpy array
-        :param tmp_dir: Temporary directory to save to
-        :param idx: Index for unique naming
-        :return: Path to the saved video file
-        """
         from torchvision.io import write_video
 
         video_path = os.path.join(tmp_dir, f"tmp_video_{idx}.mp4")
-        # frames: (F, H, W, C) uint8 -> torch tensor
         video_tensor = torch.from_numpy(frames).to(torch.uint8)
         write_video(video_path, video_tensor, self.save_fps, video_codec="h264")
         return video_path
 
     def _convert_to_video_frames(self, images) -> List[np.ndarray]:
-        """
-        Convert various input formats to list of (F, H, W, C) uint8 numpy arrays.
-
-        Supports:
-        - np.ndarray (B, F, H, W, C) or (B, H, W, C) 
-        - torch.Tensor various layouts
-        - List of np.ndarray / PIL.Image
-        """
         result = []
         if isinstance(images, np.ndarray):
             if images.ndim == 5:
-                # (B, F, H, W, C)
                 for i in range(images.shape[0]):
                     result.append(images[i])
             elif images.ndim == 4:
-                # (B, H, W, C) - single frame per sample
                 for i in range(images.shape[0]):
-                    result.append(images[i:i+1])  # (1, H, W, C)
+                    result.append(images[i:i+1])
         elif isinstance(images, torch.Tensor):
             images_np = images.cpu().numpy() if images.is_cuda else images.numpy()
             return self._convert_to_video_frames(images_np)
@@ -120,9 +67,9 @@ class VideoAlignScorer:
             for img in images:
                 if isinstance(img, np.ndarray):
                     if img.ndim == 4:
-                        result.append(img)  # (F, H, W, C)
+                        result.append(img)
                     elif img.ndim == 3:
-                        result.append(img[np.newaxis])  # (1, H, W, C)
+                        result.append(img[np.newaxis])
                 elif isinstance(img, Image.Image):
                     arr = np.array(img)
                     result.append(arr[np.newaxis])
@@ -140,22 +87,13 @@ class VideoAlignScorer:
         images: Union[List, np.ndarray, torch.Tensor],
         prompts: List[str],
     ) -> List[float]:
-        """
-        Compute VideoAlign reward scores.
-
-        :param images: Video data. Expects (B, F, H, W, C) uint8 [0,255] numpy.
-                       Also supports other common formats (auto-converted).
-        :param prompts: List of B text prompts.
-        :return: List of B reward scores.
-        """
+        """Backward compatibility for raw frames input."""
         video_frames_list = self._convert_to_video_frames(images)
         assert len(video_frames_list) == len(prompts), \
             f"Number of videos ({len(video_frames_list)}) must match prompts ({len(prompts)})"
 
-        # Create a temporary directory for video files
         tmp_dir = tempfile.mkdtemp(prefix="videoalign_")
         try:
-            # Save all videos to temp files
             video_paths = []
             for i, frames in enumerate(video_frames_list):
                 if frames.dtype != np.uint8:
@@ -163,39 +101,121 @@ class VideoAlignScorer:
                 path = self._save_video_to_tempfile(frames, tmp_dir, i)
                 video_paths.append(path)
 
-            # Call VideoAlign inference
-            rewards = self.inferencer.reward(
-                video_paths=video_paths,
-                prompts=prompts,
-                fps=self.fps,
-                num_frames=self.num_frames,
-                max_pixels=self.max_pixels,
-                use_norm=self.use_norm,
-            )
-
-            # Extract the requested dimension
-            scores = [r[self.reward_dim] for r in rewards]
-            return scores
-
+            return self.score_files(video_paths, prompts)
         finally:
-            # Clean up temp files
             shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    @torch.no_grad()
+    def score_files(self, video_paths: List[str], prompts: List[str]) -> List[float]:
+        """
+        Directly compute VideoAlign reward scores for existing video files.
+        """
+        assert len(video_paths) == len(prompts), \
+            f"Number of video files ({len(video_paths)}) must match prompts ({len(prompts)})"
+            
+        rewards = self.inferencer.reward(
+            video_paths=video_paths,
+            prompts=prompts,
+            fps=self.fps,
+            num_frames=self.num_frames,
+            max_pixels=self.max_pixels,
+            use_norm=self.use_norm,
+        )
+
+        scores = [r[self.reward_dim] for r in rewards]
+        return scores
+
+
+def process_video_folders(main_dir: str, prompt_file: str, scorer: VideoAlignScorer):
+    """
+    遍历主文件夹中的子文件夹，读取对应的视频并计算分数，最后保存为 json。
+    """
+    # 1. 读取 prompt 文件
+    if not os.path.exists(prompt_file):
+        raise FileNotFoundError(f"Prompt txt file not found: {prompt_file}")
+        
+    with open(prompt_file, 'r', encoding='utf-8') as f:
+        # 去除换行符和首尾空白
+        prompts = [line.strip() for line in f.readlines() if line.strip()]
+    
+    print(f"Loaded {len(prompts)} prompts from {prompt_file}.")
+
+    # 2. 遍历主文件夹下的子文件夹
+    for subdir_name in os.listdir(main_dir):
+        subdir_path = os.path.join(main_dir, subdir_name)
+        
+        # 跳过非文件夹项
+        if not os.path.isdir(subdir_path):
+            continue
+            
+        video_paths = []
+        batch_prompts = []
+        video_names = []
+        
+        # 3. 匹配 video_i.mp4 与对应的 prompt
+        for i, prompt in enumerate(prompts):
+            vid_name = f"video_{i}.mp4"
+            vid_path = os.path.join(subdir_path, vid_name)
+            
+            if os.path.exists(vid_path):
+                video_paths.append(vid_path)
+                batch_prompts.append(prompt)
+                video_names.append(vid_name)
+                
+        if not video_paths:
+            print(f"No corresponding videos found in {subdir_path}, skipping.")
+            continue
+            
+        print(f"\nProcessing {len(video_paths)} videos in {subdir_path}...")
+        
+        # 4. 计算分数
+        try:
+            scores = scorer.score_files(video_paths, batch_prompts)
+            
+            # 整理结果
+            results = {}
+            for v_name, score in zip(video_names, scores):
+                results[v_name] = float(score)  # 转换为Python内置float以便json序列化
+                
+            avg_score = sum(scores) / len(scores)
+            
+            output_data = {
+                "scores": results,
+                "average_score": float(avg_score)
+            }
+            
+            # 5. 保存结果到子文件夹
+            out_json = os.path.join(subdir_path, "videoalign_scores.json")
+            with open(out_json, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=4, ensure_ascii=False)
+                
+            print(f"Success! Saved results to {out_json} (Average Score: {avg_score:.4f})")
+            
+        except Exception as e:
+            print(f"Error processing {subdir_path}: {e}")
 
 
 if __name__ == "__main__":
-    # Example usage
+    # 使用 argparse 以便在命令行中更灵活地传入参数
+    parser = argparse.ArgumentParser(description="Process videos and calculate VideoAlign scores.")
+    parser.add_argument("--main_dir", type=str, default="/home/ma-user/work/xianyi/osp_next/TorchDiff/samples/osp_next_mixgrpo/moviegen/lr805", help="Path to the main folder containing subfolders of videos.")
+    parser.add_argument("--prompt_file", type=str, default="/home/ma-user/work/xianyi/osp_next/TorchDiff/assets/t2v/eval_Moviegen.txt", help="Path to the txt file containing prompts.")
+    parser.add_argument("--ckpt_path", type=str, default="/home/ma-user/work/xianyi/ckpts/KlingTeam/VideoReward", help="Path to VideoAlign checkpoint.")
+    parser.add_argument("--device", type=str, default="npu", help="Device to run on (e.g., cuda, npu).")
+    parser.add_argument("--reward_dim", type=str, default="Overall", choices=["VQ", "MQ", "TA", "Overall"], help="Reward dimension.")
+    
+    args = parser.parse_args()
+
+    # 初始化打分器
     scorer = VideoAlignScorer(
-        device="npu",
-        load_from_pretrained="/home/ma-user/work/xianyi/ckpts/KlingTeam/VideoReward",
-        reward_dim="Overall",
+        device=args.device,
+        load_from_pretrained=args.ckpt_path,
+        reward_dim=args.reward_dim,
     )
 
-    # Simulate a batch of 2 videos, each with 16 frames at 256x256
-    batch_videos = np.random.randint(0, 255, (2, 16, 256, 256, 3), dtype=np.uint8)
-    prompts = [
-        "A person walking in a park",
-        "A cat playing with a ball",
-    ]
-
-    scores = scorer(batch_videos, prompts)
-    print(f"VideoAlign scores: {scores}")
+    # 执行文件夹批量处理
+    process_video_folders(
+        main_dir=args.main_dir,
+        prompt_file=args.prompt_file,
+        scorer=scorer
+    )

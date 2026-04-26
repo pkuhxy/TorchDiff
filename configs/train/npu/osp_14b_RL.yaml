@@ -37,7 +37,14 @@ model_config:
     num_layers: 40
     num_register_tokens: 0
     out_dim: 16
-    pretrained_model_dir_or_checkpoint: /home/ma-user/work/gyy/TorchDiff/output/osp_next_14b_81f720p_sparse2d2_ssp4/iter_000006000/ema_model_state_dict.pt
+    # HIF8 quantization settings
+    # Set quant to "hif8" to enable quantization simulation on Q/K/V/O and FFN linears.
+    # Set to null (or omit) to use plain nn.Linear.
+    quant: "hif8"
+    quant_attn: "hif8"
+    scale_max_forward: 15.0    # forward activation scale clamp (HIF8 max ≈ 15)
+    scale_max_backward: 224.0  # backward gradient scale clamp  (HIF8 max ≈ 224)
+    pretrained_model_dir_or_checkpoint: /home/ma-user/work/gyy/TorchDiff/output/hif8/osp_next_14b_81f720p_sparse2d2_ssp4_from_full/iter_000006000/ema_model_state_dict.pt
     skiparse_1d: false
     skiparse_2d: true
     skiparse_model_type: dual_end
@@ -45,12 +52,13 @@ model_config:
     text_len: 512
 model_name: osp_next
 optimizer_config:
-    lr: 1.0e-05
+    lr: 1.0e-4
+    # resume_lr: 1.0e-4
     weight_decay: 0.001
-output_dir: output/osp_next_14b_lr1e_5_81f720p_sparse2d2_sp2_ssp4_grpo4_node7
+output_dir: output/osp_next_14b_lr1e_5_81f720p_sparse2d2_sp2_ssp4_grpo4_node7_lr1e04_hif8
 profiling: false
-reshard_after_forward: true
-save_interval: 2
+reshard_after_forward: false
+save_interval: 1
 save_with_dcp_api: true
 scheduler_config:
     scheduler_name: flow_matching
@@ -69,9 +77,11 @@ vae_config:
     dtype: fp32
     vae_path: /home/ma-user/work/gyy/TorchDiff/Wan2.1-T2V-14B/Wan2.1_VAE.pth
 wandb_config:
-    exp_name: osp_next_14b_lr1e_5_81f720p_sparse2d2_sp2_ssp4
+    exp_name: osp_next_14b_lr1e_5_81f720p_sparse2d2_sp2_ssp4_hif8
     project_name: osp_next_RL_14b
 weight_dtype: bf16
+
+# resume_epoch: 15
 
 rl_config:
   prompt_file: "/home/ma-user/work/xianyi/osp_next/dataset/vbench/vbench_train.txt"

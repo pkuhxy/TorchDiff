@@ -494,9 +494,12 @@ def compute_log_prob_for_training(
     # 内部的标量运算不兼容 DTensor。
     # 注意: DTensor.full_tensor() 在某些环境（如 NPU）下可能不支持 autograd backward，
     # 导致梯度无法回传到 LoRA 参数。使用 redistribute + _local_tensor 保留梯度图。
+    # if isinstance(noise_pred, DTensor):
+    #     from torch.distributed.tensor.placement_types import Replicate
+    #     noise_pred = noise_pred.redistribute(placements=[Replicate()])._local_tensor
+
     if isinstance(noise_pred, DTensor):
-        from torch.distributed.tensor.placement_types import Replicate
-        noise_pred = noise_pred.redistribute(placements=[Replicate()])._local_tensor
+        noise_pred = noise_pred.full_tensor()  # 保留完整的 autograd 链路
 
     prev_sample, log_prob, prev_sample_mean, std_dev_t, dt = sde_step_with_logprob(
         sigmas_schedule,
@@ -506,8 +509,17 @@ def compute_log_prob_for_training(
         num_inference_steps,
         prev_sample=sample["next_latents"][:, step_idx].float(),
         return_dt_and_std_dev_t=True,
-        cp_group=None,  # 训练阶段直接给定 prev_sample 不生成噪声，不需传 cp_group
+        cp_group=None,
     )
+
+    # --- DEBUG: 验证 log_prob 梯度链路 ---
+    if torch.distributed.get_rank() == 0 and step_idx == 0:
+        _diff = (sample["next_latents"][:, step_idx].float().detach() - prev_sample_mean.detach())
+        print(f"[DEBUG chain] noise_pred.requires_grad={noise_pred.requires_grad}, "
+              f"log_prob.requires_grad={log_prob.requires_grad}, "
+              f"log_prob.grad_fn={log_prob.grad_fn}, "
+              f"|prev_sample - prev_sample_mean|={_diff.abs().mean().item():.8f}")
+    # --- END DEBUG ---
 
     return prev_sample, log_prob, prev_sample_mean, std_dev_t, dt
 
@@ -686,6 +698,39 @@ def save_lora_checkpoint(model, save_dir, global_step):
         print(f"[Rank 0] LoRA checkpoint saved to {save_root} ({len(lora_state_dict)} parameters)")
 
 
+RL_TRAINING_STATE_FILE = "rl_training_state.json"
+
+
+def save_rl_training_state(save_dir, global_step, next_epoch):
+    """Persist RL resume metadata alongside each checkpoint."""
+    save_root = os.path.join(save_dir, f"{checkpoint_prefix}{global_step:09d}")
+    if dist.get_rank() == 0:
+        os.makedirs(save_root, exist_ok=True)
+        with open(os.path.join(save_root, RL_TRAINING_STATE_FILE), "w", encoding="ascii") as f:
+            json.dump(
+                {
+                    "global_step": int(global_step),
+                    "next_epoch": int(next_epoch),
+                },
+                f,
+                indent=2,
+            )
+    dist.barrier()
+
+
+def load_rl_training_state(save_dir, global_step):
+    """Load RL resume metadata for epoch/global_step bookkeeping."""
+    state_path = os.path.join(
+        save_dir,
+        f"{checkpoint_prefix}{global_step:09d}",
+        RL_TRAINING_STATE_FILE,
+    )
+    if not os.path.exists(state_path):
+        return None
+    with open(state_path, "r", encoding="ascii") as f:
+        return json.load(f)
+
+
 
 # ==================== Main Training ====================
 
@@ -765,6 +810,9 @@ def main(config):
     log_interval = config.get("log_interval", 1)
     save_interval = config.get("save_interval", 100)
     weight_dtype = config.get("weight_dtype", "bfloat16")
+    resume_epoch = config.get("resume_epoch", None)
+    resume_override_lr = optimizer_config.get("resume_override_lr", False)
+    resume_lr = optimizer_config.get("resume_lr", None)
     reshard_after_forward = config.get("reshard_after_forward", None)
     model_cpu_offload = config.get("model_cpu_offload", False)
     encoder_cpu_offload = config.get("encoder_cpu_offload", False)
@@ -1085,8 +1133,55 @@ def main(config):
         adaptive_grad_clipper.load(
             output_dir=f"{output_dir}/{checkpoint_prefix}{checkpointer.last_training_iteration:09d}"
         )
+        override_lr = None
+        if resume_lr is not None:
+            override_lr = resume_lr
+        elif resume_override_lr:
+            override_lr = learning_rate
+        if override_lr is not None:
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = override_lr
+            log_on_main_process(
+                logger,
+                f"Resume LR override enabled, force optimizer lr to {override_lr}",
+            )
 
-    first_epoch = 0 if checkpointer.last_training_iteration is None else checkpointer.last_training_iteration
+    resume_global_step = 0 if checkpointer.last_training_iteration is None else checkpointer.last_training_iteration
+    start_epoch = 0
+    if checkpointer.last_training_iteration is not None:
+        if resume_epoch is not None:
+            start_epoch = int(resume_epoch)
+            log_on_main_process(
+                logger,
+                f"Resume epoch manually specified as {start_epoch}. "
+                "Skipping auto epoch recovery from rl_training_state.json.",
+            )
+        else:
+            rl_training_state = load_rl_training_state(output_dir, resume_global_step)
+            if rl_training_state is not None:
+                start_epoch = int(rl_training_state.get("next_epoch", 0))
+                saved_global_step = int(rl_training_state.get("global_step", resume_global_step))
+                if saved_global_step != resume_global_step:
+                    log_on_main_process(
+                        logger,
+                        f"Warning! RL training state global_step={saved_global_step} "
+                        f"does not match checkpoint folder step={resume_global_step}. "
+                        f"Using checkpoint folder step.",
+                    )
+            else:
+                log_on_main_process(
+                    logger,
+                    "Warning! RL training state file not found for resume checkpoint. "
+                    "Falling back to start_epoch=0; epoch continuity cannot be guaranteed. "
+                    "Set config.resume_epoch to recover the expected epoch manually.",
+                )
+    elif resume_epoch is not None:
+        start_epoch = int(resume_epoch)
+        log_on_main_process(
+            logger,
+            f"resume_epoch={start_epoch} is set but no checkpoint was found in output_dir. "
+            "Training will start from scratch with the specified epoch index.",
+        )
 
     set_seed(seed, device_specific=True, process_group=dp_group, deterministic=deterministic_training)
 
@@ -1266,6 +1361,12 @@ def main(config):
     Weight dtype: {weight_dtype}
     EMA decay: {ema_decay}
     Learning rate: {learning_rate}
+    Resume global step: {resume_global_step}
+    Start epoch: {start_epoch}
+    Resume epoch override: {resume_epoch}
+    Resume LR override: {resume_override_lr}
+    Resume LR value: {resume_lr if resume_lr is not None else 'follow optimizer_config.lr'}
+    Current optimizer lr: {optimizer.param_groups[0]['lr']}
     Gradient accumulation steps: {gradient_accumulation_steps}
     FSDP size: {fsdp_size}
     DDP size: {ddp_size}
@@ -1285,7 +1386,8 @@ def main(config):
     """)
 
     # ========== Training Loop ==========
-    global_step = first_epoch
+    global_step = resume_global_step
+    last_completed_epoch = start_epoch - 1
     train_iter = iter(train_dataloader)
 
     # Compute latent shape
@@ -1302,7 +1404,7 @@ def main(config):
     # Number of training timesteps determines gradient accumulation
     accum_steps_total = gradient_accumulation_steps * num_train_timesteps
 
-    for epoch in range(first_epoch, num_epochs):
+    for epoch in range(start_epoch, num_epochs):
         # ==================== SAMPLING PHASE ====================
         model.eval()
 
@@ -1894,11 +1996,13 @@ def main(config):
             checkpointer.save_ema_model(model, global_step)
             ema_model.restore(model)
             adaptive_grad_clipper.save(output_dir=f"{output_dir}/{checkpoint_prefix}{global_step:09d}")
+            save_rl_training_state(output_dir, global_step, epoch + 1)
             # Also save LoRA-specific checkpoint
             if hasattr(model, 'save_pretrained'):
                 save_lora_checkpoint(model, output_dir, global_step)
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+        last_completed_epoch = epoch
 
         # ==================== EVAL PHASE ====================
         if (test_dataloader is not None
@@ -2058,6 +2162,7 @@ def main(config):
             log_on_main_process(logger, f"[Eval] Eval video generation done at global_step {global_step}.")
 
     # ========== Final save ==========
+    completed_epochs = max(start_epoch, last_completed_epoch + 1)
     log_on_main_process(logger, f"Saving final checkpoint at global_step {global_step}...")
     checkpointer.save(model, optimizer, None, global_step)
     ema_model.store(model)
@@ -2065,13 +2170,14 @@ def main(config):
     checkpointer.save_ema_model(model, global_step)
     ema_model.restore(model)
     adaptive_grad_clipper.save(output_dir=f"{output_dir}/{checkpoint_prefix}{global_step:09d}")
+    save_rl_training_state(output_dir, global_step, completed_epochs)
     # Also save LoRA-specific checkpoint
     if hasattr(model, 'save_pretrained'):
         save_lora_checkpoint(model, output_dir, global_step)
 
     log_on_main_process(logger, f"""
     {'=' * 20}End RL Training (LoRA + FSDP2){'=' * 20}
-    Total epochs: {epoch + 1}
+    Total epochs: {completed_epochs}
     Total global steps: {global_step}
     Model saved to {output_dir}
     {'=' * 20}{'=' * len('End RL Training (LoRA + FSDP2)')}{'=' * 20}

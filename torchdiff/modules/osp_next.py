@@ -1122,8 +1122,25 @@ class OSPNextAttentionBlock(nn.Module):
             x = torch.cat([register_tokens, x], dim=1)
 
         if gradient_checkpointing and torch.is_grad_enabled():
+            # 收集本 block 内所有 LoRA 参数，显式传入 checkpoint，
+            # 确保 checkpoint 的 autograd 能正确追踪 LoRA 参数的梯度。
+            # 不这样做的话，use_reentrant=False 的 checkpoint 在 FSDP2 环境下
+            # 无法感知 LoRA 参数参与了计算，导致 LoRA 梯度为零。
+            _lora_params = [p for n, p in self.named_parameters() if 'lora_' in n]
+
+            def _checkpointed_block_forward(x, attn_mask, cross_attn_mask, e,
+                                            grid_sizes_for_rope, rope_wrapper, text,
+                                            *_lora_dummy_args,
+                                            num_register_tokens=None, shard_seq_lens=None):
+                return self.block_forward(
+                    x, attn_mask, cross_attn_mask, e,
+                    grid_sizes_for_rope, rope_wrapper, text,
+                    num_register_tokens=num_register_tokens,
+                    shard_seq_lens=shard_seq_lens,
+                )
+
             x = torch.utils.checkpoint.checkpoint(
-                self.block_forward,
+                _checkpointed_block_forward,
                 x,
                 attn_mask,
                 cross_attn_mask,
@@ -1131,6 +1148,7 @@ class OSPNextAttentionBlock(nn.Module):
                 grid_sizes_for_rope,
                 rope_wrapper,
                 text,
+                *_lora_params,
                 num_register_tokens=num_register_tokens,
                 shard_seq_lens=shard_seq_lens,
                 use_reentrant=False,

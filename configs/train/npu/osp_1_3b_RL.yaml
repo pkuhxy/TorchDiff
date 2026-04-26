@@ -82,8 +82,10 @@ rl_config:
   sde_steps: 10
   num_inference_steps: 25
   kl_beta: 0.004
-  num_batches_per_epoch: 4
+  num_batches_per_epoch: 1
   num_image_per_prompt: 4
+  sample_batch_size: 1
+  train_batch_size: 1
   reward_fn: 
     videoalign: 1.0
   

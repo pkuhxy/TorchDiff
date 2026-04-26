@@ -4,8 +4,8 @@ model_name: "osp_next"
 pipeline_name: "t2v"
 seed: 1024
 
-prompt_txt: "assets/t2v/MovieGenVideoBench_rewritten.txt"
-output_dir: "samples/osp_next_mixgrpo/moviegen/step148"
+prompt_txt: "assets/t2v/eval_Moviegen.txt"
+output_dir: "samples/osp_next_mixgrpo/moviegen/lr805/step52"
 
 num_frames: 81
 height: 720
@@ -58,4 +58,4 @@ text_encoder_config:
   use_fsdp: True
 
 
-lora_path: /home/ma-user/work/xianyi/osp_next/TorchDiff/output/osp_next_14b_lr1e_5_81f720p_sparse2d2_sp2_ssp4_grpo4_node7/lora-checkpoint-148/adapter_model.bin
+lora_path: /home/ma-user/work/xianyi/osp_next/TorchDiff/output/osp_next_14b_lr1e_5_81f720p_sparse2d2_sp2_ssp4_grpo4_node7_lr8e05/lora-checkpoint-52/adapter_model.bin
